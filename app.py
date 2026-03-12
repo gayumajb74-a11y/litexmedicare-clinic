@@ -1,1143 +1,1564 @@
 """
-MediCare Clinic System — Flask Web App
-Run locally:  python app.py
-Deploy free:  Railway / Render / PythonAnywhere
+==============================================
+  MediCare Clinic System
+  Pure Python - NO external dependencies
+  Run: python clinic.py
+  Open: http://localhost:8080
+==============================================
+  Default Doctor: Dr. Admin / admin123
+==============================================
+  FLOW:
+  1. Patient submits admission form -> status: Pending
+  2. Doctor clicks patient row -> Examine page
+  3. Doctor fills checkup + prescription -> status: Examined
+  4. Doctor clicks Back -> Dashboard shows Examined (green)
+==============================================
 """
 
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
-import sqlite3, hashlib, uuid, os, re
+import http.server
+import urllib.parse
+import sqlite3
+import hashlib
+import json
+import os
+import uuid
+import re
 from datetime import datetime
-from functools import wraps
+from http.cookies import SimpleCookie
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "medicare-secret-2024-change-in-prod")
+DB = "clinic.db"
+PORT = 8080
+SESSIONS = {}
 
-DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clinic.db")
 
-# ══════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
 #  DATABASE
-# ══════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
 def get_db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    return c
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
-    with get_db() as c:
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS staff (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                name       TEXT UNIQUE NOT NULL,
-                role       TEXT NOT NULL DEFAULT 'Doctor',
-                password   TEXT NOT NULL,
-                qr_id      TEXT UNIQUE NOT NULL,
+    with get_db() as db:
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS doctors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                qr_id TEXT UNIQUE NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS patients (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                name         TEXT NOT NULL,
-                age          TEXT NOT NULL DEFAULT '',
-                contact      TEXT NOT NULL DEFAULT '',
-                appt_date    TEXT NOT NULL,
-                appt_time    TEXT NOT NULL,
-                queue_no     INTEGER NOT NULL DEFAULT 1,
-                symptoms     TEXT NOT NULL DEFAULT '',
-                status       TEXT NOT NULL DEFAULT 'Waiting',
-                diagnosis    TEXT NOT NULL DEFAULT '',
-                notes        TEXT NOT NULL DEFAULT '',
-                examined_by  TEXT NOT NULL DEFAULT '',
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                date_of_appointment TEXT NOT NULL,
+                appointment_time TEXT NOT NULL,
+                symptoms TEXT NOT NULL,
+                status TEXT DEFAULT 'Pending',
+                diagnosis TEXT DEFAULT '',
+                prescription TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                examined_at TEXT DEFAULT '',
                 submitted_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        if c.execute("SELECT COUNT(*) FROM staff").fetchone()[0] == 0:
-            c.execute("INSERT INTO staff(name,role,password,qr_id) VALUES(?,?,?,?)",
-                ("Dr. Admin","Doctor",hashlib.sha256(b"admin123").hexdigest(),str(uuid.uuid4())))
-            c.commit()
+        # Migration: add examine columns if they don't exist
+        for col, definition in [
+            ("diagnosis", "TEXT DEFAULT ''"),
+            ("prescription", "TEXT DEFAULT ''"),
+            ("notes", "TEXT DEFAULT ''"),
+            ("examined_at", "TEXT DEFAULT ''"),
+        ]:
+            try:
+                db.execute(f"ALTER TABLE patients ADD COLUMN {col} {definition}")
+                db.commit()
+            except Exception:
+                pass
 
-def next_queue(date):
-    with get_db() as c:
-        r = c.execute("SELECT MAX(queue_no) FROM patients WHERE appt_date=?",(date,)).fetchone()
-        return (r[0] or 0) + 1
+        cur = db.execute("SELECT COUNT(*) as c FROM doctors")
+        if cur.fetchone()["c"] == 0:
+            pw = hashlib.sha256("admin123".encode()).hexdigest()
+            qr = str(uuid.uuid4())
+            db.execute("INSERT INTO doctors (name, password, qr_id) VALUES (?,?,?)",
+                       ("Dr. Admin", pw, qr))
+            db.commit()
 
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "staff_id" not in session:
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated
+def hash_pw(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
 
-# ══════════════════════════════════════════════════════
-#  HTML TEMPLATE  (single-file, all pages)
-# ══════════════════════════════════════════════════════
-BASE = """<!DOCTYPE html>
+
+# ─────────────────────────────────────────────
+#  HTML HELPERS
+# ─────────────────────────────────────────────
+def base_style():
+    return """
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--navy:#0a1628;--navy2:#0f1f38;--teal:#0d9488;--teal-light:#14b8a6;--gold:#d4a853}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--navy);min-height:100vh;color:#fff}
+.bg{position:fixed;inset:0;z-index:0;
+  background:radial-gradient(ellipse at 20% 50%,rgba(13,148,136,.14) 0%,transparent 60%),
+             radial-gradient(ellipse at 80% 20%,rgba(212,168,83,.09) 0%,transparent 50%)}
+.grid{position:fixed;inset:0;z-index:0;
+  background-image:linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);
+  background-size:60px 60px}
+nav{position:fixed;top:0;left:0;right:0;z-index:10;padding:1rem 2rem;
+  display:flex;align-items:center;gap:.75rem;
+  border-bottom:1px solid rgba(255,255,255,.06);backdrop-filter:blur(10px);
+  background:rgba(10,22,40,.85)}
+.logo{font-size:1.3rem;font-weight:700;color:#fff}
+.back{margin-left:auto;color:rgba(255,255,255,.4);font-size:.85rem;text-decoration:none}
+.back:hover{color:#fff}
+main{position:relative;z-index:1;flex:1;display:flex;align-items:center;
+  justify-content:center;padding:5rem 1rem 2rem;min-height:100vh}
+.panel{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
+  border-radius:24px;padding:2.5rem 2rem;width:100%;max-width:460px;
+  animation:fadeUp .5s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.picon{width:58px;height:58px;background:linear-gradient(135deg,rgba(13,148,136,.25),rgba(13,148,136,.05));
+  border:1px solid rgba(13,148,136,.3);border-radius:16px;
+  display:flex;align-items:center;justify-content:center;font-size:1.7rem;margin-bottom:1.25rem}
+h2{font-size:1.75rem;font-weight:700;margin-bottom:.35rem}
+.sub{color:rgba(255,255,255,.4);font-size:.88rem;margin-bottom:1.75rem}
+.field{margin-bottom:1.1rem}
+label{display:block;font-size:.75rem;color:rgba(255,255,255,.45);
+  margin-bottom:.45rem;letter-spacing:.06em;text-transform:uppercase}
+input,textarea,select{width:100%;padding:.8rem 1rem;
+  background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);
+  border-radius:12px;color:#fff;font-size:.92rem;outline:none;
+  transition:border-color .2s;font-family:inherit;resize:vertical}
+input:focus,textarea:focus,select:focus{border-color:var(--teal)}
+input::placeholder,textarea::placeholder{color:rgba(255,255,255,.2)}
+input[type=date]::-webkit-calendar-picker-indicator,
+input[type=time]::-webkit-calendar-picker-indicator{filter:invert(.5);cursor:pointer}
+select option{background:#0f1f38;color:#fff}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.btn{width:100%;padding:.85rem;border:none;border-radius:12px;cursor:pointer;
+  font-size:.92rem;font-weight:600;font-family:inherit;
+  background:linear-gradient(135deg,var(--teal),var(--teal-light));color:#fff;
+  transition:opacity .2s;margin-top:.4rem}
+.btn:hover{opacity:.85}
+.btn-gold{background:linear-gradient(135deg,var(--gold),#e8c06a);color:var(--navy)}
+.msg{padding:.7rem 1rem;border-radius:10px;font-size:.83rem;margin-bottom:1rem;display:none}
+.msg.error{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);color:#fca5a5}
+.msg.success{background:rgba(13,148,136,.15);border:1px solid rgba(13,148,136,.3);color:var(--teal-light)}
+.tabs{display:flex;gap:.4rem;margin-bottom:1.5rem;background:rgba(0,0,0,.2);
+  border-radius:12px;padding:4px}
+.tab{flex:1;text-align:center;padding:.55rem;border-radius:9px;font-size:.83rem;
+  cursor:pointer;color:rgba(255,255,255,.4);transition:all .2s;
+  font-family:inherit;border:none;background:transparent}
+.tab.active{background:rgba(13,148,136,.25);color:var(--teal-light);
+  border:1px solid rgba(13,148,136,.3)}
+.hidden{display:none!important}
+</style>"""
+
+def page(title, body, extra_head=""):
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ title }} · MediCare</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>
-:root {
-  --bg:      #080f1a;
-  --bg2:     #0d1829;
-  --card:    #111f33;
-  --card2:   #162540;
-  --border:  #1e3254;
-  --border2: #243d60;
-  --teal:    #0d9488;
-  --teal2:   #14b8a6;
-  --teal3:   #5eead4;
-  --gold:    #d4a853;
-  --gold2:   #f0c060;
-  --red:     #ef4444;
-  --red2:    #fca5a5;
-  --green:   #22c55e;
-  --green2:  #86efac;
-  --text:    #e8f0fe;
-  --text2:   #7a9cc0;
-  --text3:   #3d5a7a;
-  --white:   #ffffff;
-  --font:    'Plus Jakarta Sans', sans-serif;
-  --mono:    'JetBrains Mono', monospace;
-}
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { scroll-behavior: smooth; }
-body {
-  font-family: var(--font);
-  background: var(--bg);
-  color: var(--text);
-  min-height: 100vh;
-  line-height: 1.6;
-}
-
-/* ── NOISE + GLOW ── */
-body::before {
-  content: '';
-  position: fixed; inset: 0; z-index: 0; pointer-events: none;
-  background:
-    radial-gradient(ellipse 80% 50% at 10% 20%, rgba(13,148,136,.12) 0%, transparent 60%),
-    radial-gradient(ellipse 60% 40% at 90% 80%, rgba(212,168,83,.07) 0%, transparent 55%),
-    radial-gradient(ellipse 40% 60% at 50% 50%, rgba(14,24,42,.8) 0%, transparent 70%);
-}
-body::after {
-  content: '';
-  position: fixed; inset: 0; z-index: 0; pointer-events: none;
-  background-image:
-    linear-gradient(rgba(255,255,255,.015) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,.015) 1px, transparent 1px);
-  background-size: 48px 48px;
-}
-
-/* ── NAV ── */
-.nav {
-  position: sticky; top: 0; z-index: 100;
-  padding: .85rem 2rem;
-  display: flex; align-items: center; gap: .75rem;
-  background: rgba(8,15,26,.92);
-  backdrop-filter: blur(20px);
-  border-bottom: 1px solid var(--border);
-}
-.nav-logo { display: flex; align-items: center; gap: .6rem; }
-.nav-logo-icon {
-  width: 32px; height: 32px; border-radius: 9px;
-  background: linear-gradient(135deg, var(--teal), var(--teal2));
-  display: flex; align-items: center; justify-content: center;
-  font-size: 1rem;
-}
-.nav-logo-text { font-weight: 800; font-size: 1.1rem; letter-spacing: -.02em; }
-.nav-actions { margin-left: auto; display: flex; gap: .6rem; align-items: center; }
-.nav-user {
-  font-size: .78rem; color: var(--text2);
-  background: var(--card); border: 1px solid var(--border);
-  padding: .3rem .75rem; border-radius: 100px;
-}
-.nav-user span { color: var(--teal2); font-weight: 600; }
-
-/* ── PAGE WRAPPER ── */
-.page {
-  position: relative; z-index: 1;
-  min-height: calc(100vh - 57px);
-  display: flex; align-items: center; justify-content: center;
-  padding: 2.5rem 1.25rem;
-}
-.page-wide { align-items: flex-start; padding-top: 2rem; }
-
-/* ── CARD ── */
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  padding: 2.2rem 2rem;
-  width: 100%; max-width: 460px;
-  animation: slideUp .4s cubic-bezier(.16,1,.3,1);
-}
-.card-wide  { max-width: 560px; }
-.card-full  { max-width: 100%; }
-
-@keyframes slideUp {
-  from { opacity: 0; transform: translateY(24px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-/* ── FORM ELEMENTS ── */
-.field { margin-bottom: 1.1rem; }
-.field label {
-  display: block; font-size: .72rem; font-weight: 600;
-  color: var(--text2); letter-spacing: .08em; text-transform: uppercase;
-  margin-bottom: .42rem;
-}
-.field input, .field textarea, .field select {
-  width: 100%; padding: .72rem 1rem;
-  background: var(--card2); border: 1px solid var(--border);
-  border-radius: 10px; color: var(--text);
-  font-size: .9rem; font-family: var(--font);
-  outline: none; transition: border-color .2s, box-shadow .2s;
-  resize: vertical;
-}
-.field input:focus, .field textarea:focus, .field select:focus {
-  border-color: var(--teal);
-  box-shadow: 0 0 0 3px rgba(13,148,136,.12);
-}
-.field input::placeholder, .field textarea::placeholder { color: var(--text3); }
-.field select option { background: var(--card2); }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: .9rem; }
-.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .9rem; }
-
-/* ── BUTTONS ── */
-.btn {
-  display: inline-flex; align-items: center; justify-content: center; gap: .45rem;
-  padding: .75rem 1.5rem; border: none; border-radius: 11px;
-  font-size: .88rem; font-weight: 700; font-family: var(--font);
-  cursor: pointer; transition: all .2s; text-decoration: none;
-  letter-spacing: -.01em;
-}
-.btn-block { display: flex; width: 100%; }
-.btn-teal  { background: var(--teal);  color: #fff; }
-.btn-teal:hover  { background: var(--teal2); transform: translateY(-1px); box-shadow: 0 8px 24px rgba(13,148,136,.3); }
-.btn-gold  { background: var(--gold);  color: #0a0f1a; }
-.btn-gold:hover  { background: var(--gold2); transform: translateY(-1px); box-shadow: 0 8px 24px rgba(212,168,83,.3); }
-.btn-ghost { background: var(--card2); border: 1px solid var(--border); color: var(--text2); }
-.btn-ghost:hover { border-color: var(--teal); color: var(--teal2); }
-.btn-red   { background: rgba(239,68,68,.15); border: 1px solid rgba(239,68,68,.3); color: var(--red2); }
-.btn-red:hover   { background: rgba(239,68,68,.25); }
-.btn-green { background: rgba(34,197,94,.15); border: 1px solid rgba(34,197,94,.3); color: var(--green2); }
-.btn-green:hover { background: rgba(34,197,94,.25); }
-.btn-sm { padding: .42rem .85rem; font-size: .78rem; border-radius: 8px; }
-
-/* ── ALERTS ── */
-.alert {
-  padding: .75rem 1rem; border-radius: 10px;
-  font-size: .84rem; margin-bottom: 1rem; display: none;
-}
-.alert.show { display: block; }
-.alert-err { background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.28); color: var(--red2); }
-.alert-ok  { background: rgba(13,148,136,.12); border: 1px solid rgba(13,148,136,.28); color: var(--teal3); }
-.alert-info{ background: rgba(212,168,83,.1);  border: 1px solid rgba(212,168,83,.25); color: var(--gold2); }
-
-/* ── TABS ── */
-.tabs {
-  display: flex; gap: 3px; padding: 3px;
-  background: var(--card2); border: 1px solid var(--border);
-  border-radius: 12px; margin-bottom: 1.4rem;
-}
-.tab {
-  flex: 1; padding: .55rem; border-radius: 9px; border: none;
-  background: transparent; color: var(--text2);
-  font-size: .82rem; font-weight: 600; font-family: var(--font);
-  cursor: pointer; transition: all .2s;
-}
-.tab.active {
-  background: var(--teal); color: #fff;
-  box-shadow: 0 2px 12px rgba(13,148,136,.3);
-}
-
-/* ── BADGE ── */
-.badge {
-  display: inline-block; padding: .22rem .65rem;
-  border-radius: 100px; font-size: .72rem; font-weight: 700;
-  letter-spacing: .04em;
-}
-.badge-wait { background: rgba(212,168,83,.15); border: 1px solid rgba(212,168,83,.3); color: var(--gold2); }
-.badge-prog { background: rgba(13,148,136,.15); border: 1px solid rgba(13,148,136,.3); color: var(--teal3); }
-.badge-done { background: rgba(34,197,94,.13);  border: 1px solid rgba(34,197,94,.3);  color: var(--green2); }
-.badge-canc { background: rgba(239,68,68,.12);  border: 1px solid rgba(239,68,68,.28); color: var(--red2); }
-
-/* ── DASHBOARD LAYOUT ── */
-.dash-wrap { display: flex; min-height: calc(100vh - 57px); position: relative; z-index: 1; }
-.sidebar {
-  width: 230px; flex-shrink: 0;
-  background: var(--bg2); border-right: 1px solid var(--border);
-  display: flex; flex-direction: column;
-  position: sticky; top: 57px; height: calc(100vh - 57px); overflow-y: auto;
-}
-.sb-head { padding: 1.3rem 1.1rem; border-bottom: 1px solid var(--border); }
-.sb-role {
-  font-size: .68rem; font-weight: 700; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--teal2); margin-bottom: .2rem;
-}
-.sb-name { font-weight: 700; font-size: .95rem; }
-.sb-nav { flex: 1; padding: .75rem .6rem; display: flex; flex-direction: column; gap: 2px; }
-.sb-link {
-  display: flex; align-items: center; gap: .6rem;
-  padding: .6rem .85rem; border-radius: 9px;
-  color: var(--text2); font-size: .83rem; font-weight: 500;
-  text-decoration: none; transition: all .18s; cursor: pointer;
-  border: none; background: transparent; width: 100%; text-align: left;
-  font-family: var(--font);
-}
-.sb-link:hover { background: rgba(13,148,136,.1); color: var(--teal2); }
-.sb-link.active { background: rgba(13,148,136,.16); color: var(--teal2); font-weight: 700; }
-.sb-count {
-  margin-left: auto; font-size: .68rem; font-weight: 700;
-  padding: .1rem .45rem; border-radius: 100px;
-  background: var(--teal); color: #fff;
-}
-.sb-count.gold { background: rgba(212,168,83,.25); color: var(--gold2); }
-.sb-foot { padding: .85rem 1rem; border-top: 1px solid var(--border); }
-.main-content { flex: 1; padding: 1.5rem; overflow-x: auto; }
-
-/* ── STATS GRID ── */
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: .85rem; margin-bottom: 1.5rem; }
-.stat {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 14px; padding: 1.1rem 1rem;
-}
-.stat.teal  { border-color: rgba(13,148,136,.3); background: rgba(13,148,136,.08); }
-.stat.gold  { border-color: rgba(212,168,83,.3); background: rgba(212,168,83,.07); }
-.stat.green { border-color: rgba(34,197,94,.3);  background: rgba(34,197,94,.07); }
-.stat.red   { border-color: rgba(239,68,68,.3);  background: rgba(239,68,68,.07); }
-.stat-val { font-size: 1.9rem; font-weight: 800; line-height: 1; margin-bottom: .25rem; font-family: var(--mono); }
-.stat.teal  .stat-val { color: var(--teal2); }
-.stat.gold  .stat-val { color: var(--gold2); }
-.stat.green .stat-val { color: var(--green2); }
-.stat.red   .stat-val { color: var(--red2); }
-.stat-lbl { font-size: .7rem; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: .07em; }
-
-/* ── TABLE ── */
-.table-wrap {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 16px; overflow: hidden;
-}
-.table-top {
-  padding: 1rem 1.2rem; border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; justify-content: space-between;
-  flex-wrap: wrap; gap: .6rem;
-}
-.table-title { font-weight: 700; font-size: .95rem; }
-.filter-row { display: flex; gap: .35rem; flex-wrap: wrap; }
-.fbtn {
-  padding: .35rem .75rem; border-radius: 7px; font-size: .74rem;
-  font-weight: 600; font-family: var(--font); cursor: pointer;
-  border: 1px solid var(--border); background: var(--card2); color: var(--text2);
-  transition: all .18s;
-}
-.fbtn:hover, .fbtn.active { background: rgba(13,148,136,.15); border-color: var(--teal); color: var(--teal2); }
-.search-input {
-  padding: .42rem .85rem; border-radius: 8px; font-size: .82rem;
-  background: var(--card2); border: 1px solid var(--border); color: var(--text);
-  font-family: var(--font); outline: none; width: 200px; transition: border-color .2s;
-}
-.search-input:focus { border-color: var(--teal); }
-.search-input::placeholder { color: var(--text3); }
-table { width: 100%; border-collapse: collapse; }
-thead th {
-  padding: .65rem 1rem; text-align: left;
-  font-size: .67rem; font-weight: 700; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--text2);
-  border-bottom: 1px solid var(--border); background: var(--card2);
-}
-tbody tr { transition: background .12s; }
-tbody tr:hover { background: rgba(255,255,255,.02); }
-tbody td {
-  padding: .85rem 1rem; font-size: .85rem;
-  border-bottom: 1px solid rgba(255,255,255,.04);
-}
-tbody tr:last-child td { border-bottom: none; }
-.td-name { font-weight: 600; }
-.td-queue {
-  font-family: var(--mono); font-size: .9rem; font-weight: 700;
-  color: var(--teal2);
-}
-.action-btns { display: flex; gap: .35rem; }
-
-/* ── MODAL ── */
-.modal-overlay {
-  display: none; position: fixed; inset: 0; z-index: 500;
-  background: rgba(0,0,0,.7); backdrop-filter: blur(6px);
-  align-items: center; justify-content: center; padding: 1rem;
-}
-.modal-overlay.open { display: flex; }
-.modal {
-  background: var(--card); border: 1px solid var(--border2);
-  border-radius: 20px; padding: 1.8rem; width: 100%; max-width: 560px;
-  max-height: 90vh; overflow-y: auto;
-  animation: slideUp .3s cubic-bezier(.16,1,.3,1);
-}
-.modal h3 { font-size: 1.1rem; font-weight: 800; margin-bottom: 1.2rem; }
-.modal-btns { display: flex; gap: .6rem; margin-top: 1.2rem; }
-.modal-btns .btn { flex: 1; }
-
-/* ── INFO ROWS ── */
-.info-row {
-  display: flex; justify-content: space-between; align-items: flex-start;
-  padding: .5rem 0; border-bottom: 1px solid rgba(255,255,255,.05);
-  font-size: .85rem;
-}
-.info-row:last-child { border: none; }
-.info-lbl { color: var(--text2); flex-shrink: 0; min-width: 100px; }
-.info-val { font-weight: 600; text-align: right; word-break: break-word; }
-
-/* ── QR BOX ── */
-.qr-box {
-  background: #fff; border-radius: 14px; padding: 1.2rem;
-  display: inline-flex; margin: 1rem auto; display: block; width: fit-content;
-}
-.qr-id {
-  font-family: var(--mono); font-size: .72rem; color: var(--text2);
-  background: var(--card2); border: 1px solid var(--border);
-  border-radius: 8px; padding: .6rem .9rem; word-break: break-all;
-  line-height: 1.7; margin: .75rem 0;
-}
-
-/* ── QUEUE NUMBER ── */
-.queue-display {
-  background: linear-gradient(135deg, var(--teal), var(--teal2));
-  border-radius: 16px; padding: 1.5rem; text-align: center; margin: 1.2rem 0;
-}
-.queue-number { font-size: 4rem; font-weight: 800; font-family: var(--mono); line-height: 1; }
-.queue-label  { font-size: .75rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; opacity: .75; margin-bottom: .3rem; }
-
-/* ── LANDING ── */
-.landing-hero { max-width: 900px; width: 100%; }
-.landing-title {
-  font-size: clamp(2rem,5vw,3.5rem); font-weight: 800;
-  line-height: 1.1; letter-spacing: -.03em; margin-bottom: .75rem;
-}
-.landing-title .hl { color: var(--teal2); }
-.landing-sub { color: var(--text2); font-size: 1.05rem; max-width: 440px; line-height: 1.7; margin-bottom: 2.5rem; }
-.portal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px,1fr)); gap: 1.1rem; }
-.portal-card {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 18px; padding: 1.8rem; transition: border-color .2s, transform .2s;
-}
-.portal-card:hover { border-color: var(--teal); transform: translateY(-2px); }
-.portal-icon { font-size: 2.4rem; margin-bottom: .85rem; }
-.portal-title { font-size: 1.1rem; font-weight: 800; margin-bottom: .35rem; }
-.portal-desc { color: var(--text2); font-size: .83rem; line-height: 1.65; margin-bottom: 1.2rem; }
-.portal-btns { display: flex; gap: .5rem; flex-wrap: wrap; }
-
-/* ── EXAM LAYOUT ── */
-.exam-grid { display: grid; grid-template-columns: 320px 1fr; gap: 1.2rem; }
-@media(max-width:780px) { .exam-grid { grid-template-columns: 1fr; } }
-
-/* ── RESPONSIVE ── */
-@media(max-width:700px) {
-  .sidebar { display: none; }
-  .grid2, .grid3 { grid-template-columns: 1fr; }
-  .card { padding: 1.5rem 1.2rem; }
-  .exam-grid { grid-template-columns: 1fr; }
-}
-
-/* ── SCROLLBAR ── */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: var(--bg); }
-::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
-
-/* ── CHIP SYMPTOMS ── */
-.chip-row { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .6rem; }
-.chip {
-  padding: .28rem .75rem; border-radius: 100px; font-size: .74rem; font-weight: 600;
-  border: 1px solid var(--border); color: var(--text2); background: var(--card2);
-  cursor: pointer; transition: all .18s; user-select: none;
-}
-.chip.selected { background: rgba(212,168,83,.15); border-color: rgba(212,168,83,.4); color: var(--gold2); }
-
-/* ── STAG ── */
-.stag {
-  display: inline-block; background: rgba(13,148,136,.1); border: 1px solid rgba(13,148,136,.22);
-  color: var(--teal3); font-size: .7rem; padding: .14rem .5rem;
-  border-radius: 100px; margin: .1rem;
-}
-</style>
+<title>{title} - MediCare</title>
+{base_style()}
+{extra_head}
 </head>
 <body>
-
-<!-- NAV -->
-<nav class="nav">
-  <div class="nav-logo">
-    <div class="nav-logo-icon">🏥</div>
-    <span class="nav-logo-text">MediCare</span>
-  </div>
-  <div class="nav-actions">
-    {% if session.staff_name %}
-      <div class="nav-user">{{ session.staff_role }} · <span>{{ session.staff_name }}</span></div>
-      <a href="/logout" class="btn btn-ghost btn-sm">Sign Out</a>
-    {% else %}
-      <a href="/login" class="btn btn-ghost btn-sm">Staff Login</a>
-    {% endif %}
-  </div>
-</nav>
-
-{% block content %}{% endblock %}
-
-<script>
-// ── Tab switcher ──
-function switchTab(tab) {
-  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
-  document.querySelector('.tab[data-tab="'+tab+'"]').classList.add('active');
-  document.getElementById('panel-'+tab).style.display = 'block';
-}
-
-// ── Filter table ──
-function filterTable(status, btn) {
-  document.querySelectorAll('.fbtn').forEach(b => b.classList.remove('active'));
-  if (btn) btn.classList.add('active');
-  var rows = document.querySelectorAll('tbody tr[data-status]');
-  var srch = (document.getElementById('srch') || {value:''}).value.toLowerCase();
-  rows.forEach(function(r) {
-    var match_status = !status || r.dataset.status === status;
-    var match_srch   = !srch   || r.dataset.name.toLowerCase().includes(srch) || r.dataset.queue.includes(srch);
-    r.style.display  = (match_status && match_srch) ? '' : 'none';
-  });
-}
-
-// ── Search ──
-function doSearch() {
-  var active = document.querySelector('.fbtn.active');
-  var status = active ? active.dataset.filter : '';
-  filterTable(status, active);
-}
-
-// ── Modal ──
-function openModal(id)  { document.getElementById(id).classList.add('open'); }
-function closeModal(id) { document.getElementById(id).classList.remove('open'); }
-document.addEventListener('click', function(e) {
-  if (e.target.classList.contains('modal-overlay')) e.target.classList.remove('open');
-});
-</script>
+<div class="bg"></div><div class="grid"></div>
+{body}
 </body>
 </html>"""
 
-# ══════════════════════════════════════════════════════
-#  PAGES
-# ══════════════════════════════════════════════════════
 
-LANDING = BASE.replace("{% block content %}{% endblock %}", """
-{% block content %}
-<div class="page" style="align-items:flex-start;padding-top:4rem">
-  <div class="landing-hero" style="position:relative;z-index:1">
-
-    <div style="display:inline-flex;align-items:center;gap:.5rem;
-      background:rgba(13,148,136,.1);border:1px solid rgba(13,148,136,.25);
-      border-radius:100px;padding:.32rem 1rem;font-size:.72rem;font-weight:700;
-      color:var(--teal2);letter-spacing:.1em;text-transform:uppercase;margin-bottom:1.4rem">
-      ● Clinic Management System
+# ─────────────────────────────────────────────
+#  PAGE BUILDERS
+# ─────────────────────────────────────────────
+def page_landing():
+    body = """
+<nav>
+  <span>🏥</span><span class="logo">MediCare Clinic</span>
+</nav>
+<main style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2rem">
+  <div style="text-align:center;animation:fadeUp .6s ease">
+    <div style="display:inline-block;border:1px solid rgba(13,148,136,.4);color:var(--teal-light);
+      font-size:.72rem;letter-spacing:.2em;text-transform:uppercase;padding:.4rem 1.2rem;
+      border-radius:100px;margin-bottom:1.5rem;background:rgba(13,148,136,.08)">
+      Patient &amp; Doctor Portal
     </div>
-
-    <h1 class="landing-title">Healthcare<br>Made <span class="hl">Simple</span></h1>
-    <p class="landing-sub">Manage patient appointments, doctor examinations, and clinic workflows — accessible from any device, anywhere.</p>
-
-    <div class="portal-grid">
-      <!-- Staff Portal -->
-      <div class="portal-card">
-        <div class="portal-icon">👨‍⚕️</div>
-        <div class="portal-title">Staff Portal</div>
-        <p class="portal-desc">For Doctors & Nurses. View the patient queue, examine patients, update diagnosis and notes.</p>
-        <div class="portal-btns">
-          <a href="/login"    class="btn btn-teal btn-sm">Sign In</a>
-          <a href="/register" class="btn btn-ghost btn-sm">Register</a>
-        </div>
-      </div>
-      <!-- Patient Portal -->
-      <div class="portal-card" style="border-color:rgba(212,168,83,.25)">
-        <div class="portal-icon">🩺</div>
-        <div class="portal-title">Patient Admission</div>
-        <p class="portal-desc">Book your appointment. Choose a date and time — you'll get a queue number instantly.</p>
-        <div class="portal-btns">
-          <a href="/admission" class="btn btn-gold btn-sm">Book Appointment</a>
-        </div>
-      </div>
-    </div>
-
+    <h1 style="font-size:clamp(2.2rem,5vw,4rem);line-height:1.15;margin-bottom:1rem">
+      Healthcare Made <span style="color:var(--teal-light)">Simple</span>
+    </h1>
+    <p style="color:rgba(255,255,255,.4);max-width:440px;margin:0 auto;line-height:1.7;font-size:.95rem">
+      Streamlined clinic management — book appointments and manage patient care.
+    </p>
   </div>
-</div>
-{% endblock %}""")
-
-# ── Routes ────────────────────────────────────────────────────────────
-
-@app.route("/")
-def landing():
-    return render_template_string(LANDING, title="Home")
-
-
-@app.route("/register", methods=["GET","POST"])
-def register():
-    error = ""; qr_id = ""; staff_name = ""; staff_role = ""
-    if request.method == "POST":
-        name = request.form.get("name","").strip()
-        role = request.form.get("role","Doctor").strip()
-        pw   = request.form.get("password","").strip()
-        pw2  = request.form.get("password2","").strip()
-        if not name:        error = "Full name is required."
-        elif len(pw) < 6:   error = "Password must be at least 6 characters."
-        elif pw != pw2:     error = "Passwords do not match."
-        else:
-            qr = str(uuid.uuid4())
-            try:
-                with get_db() as c:
-                    c.execute("INSERT INTO staff(name,role,password,qr_id) VALUES(?,?,?,?)",
-                              (name, role, hashlib.sha256(pw.encode()).hexdigest(), qr))
-                    c.commit()
-                qr_id = qr; staff_name = name; staff_role = role
-            except Exception as e:
-                error = "That name is already registered." if "UNIQUE" in str(e) else str(e)
-
-    tmpl = BASE.replace("{% block content %}{% endblock %}", """
-{% block content %}
-<div class="page">
-<div class="card card-wide" style="position:relative;z-index:1">
-
-{% if qr_id %}
-  <div style="text-align:center">
-    <div style="font-size:3rem;margin-bottom:.5rem">✅</div>
-    <h2 style="font-size:1.5rem;font-weight:800;margin-bottom:.3rem">Account Created!</h2>
-    <p style="color:var(--text2);font-size:.85rem;margin-bottom:1.2rem">{{ staff_role }}: {{ staff_name }}</p>
-    <div class="alert alert-info show" style="text-align:left">
-      ⚠️ <strong>Save your QR ID below</strong> — use it to log in via QR instead of password. This is shown only once!
-    </div>
-    <div class="qr-id">{{ qr_id }}</div>
-    <p style="font-size:.78rem;color:var(--text3);margin-bottom:1.2rem">Copy and save this ID somewhere safe (Notes, screenshot, etc.)</p>
-    <a href="/login" class="btn btn-teal btn-block">Go to Login →</a>
-  </div>
-
-{% else %}
-  <h2 style="font-size:1.5rem;font-weight:800;margin-bottom:.25rem">Create Staff Account</h2>
-  <p style="color:var(--text2);font-size:.84rem;margin-bottom:1.5rem">For Doctors and Nurses only — patients use the Admission form</p>
-
-  {% if error %}
-  <div class="alert alert-err show">{{ error }}</div>
-  {% endif %}
-
-  <form method="POST">
-    <div class="field">
-      <label>Role</label>
-      <div style="display:flex;gap:.75rem">
-        <label style="display:flex;align-items:center;gap:.45rem;cursor:pointer;text-transform:none;font-size:.88rem;font-weight:500;color:var(--text)">
-          <input type="radio" name="role" value="Doctor" checked style="accent-color:var(--teal);width:16px;height:16px"> Doctor
-        </label>
-        <label style="display:flex;align-items:center;gap:.45rem;cursor:pointer;text-transform:none;font-size:.88rem;font-weight:500;color:var(--text)">
-          <input type="radio" name="role" value="Nurse"  style="accent-color:var(--teal);width:16px;height:16px"> Nurse
-        </label>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+    gap:1.25rem;max-width:800px;width:100%;padding:0 1rem;animation:fadeUp .7s .15s ease both">
+    <div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
+      border-radius:20px;padding:2rem 1.75rem;text-align:center">
+      <div style="font-size:2.5rem;margin-bottom:1rem">👨‍⚕️</div>
+      <div style="font-size:1.2rem;font-weight:700;margin-bottom:.5rem">Doctor Portal</div>
+      <p style="color:rgba(255,255,255,.35);font-size:.83rem;line-height:1.6;margin-bottom:1.5rem">
+        Access dashboard, view appointments, manage patient records.
+      </p>
+      <div style="display:flex;gap:.6rem;justify-content:center;flex-wrap:wrap">
+        <a href="/doctor/login" style="background:linear-gradient(135deg,var(--teal),var(--teal-light));
+          color:#fff;padding:.6rem 1.3rem;border-radius:100px;text-decoration:none;font-size:.83rem;font-weight:600">
+          Sign In
+        </a>
+        <a href="/doctor/register" style="background:transparent;border:1px solid rgba(13,148,136,.4);
+          color:var(--teal-light);padding:.6rem 1.3rem;border-radius:100px;text-decoration:none;font-size:.83rem">
+          Register
+        </a>
       </div>
     </div>
-    <div class="field">
-      <label>Full Name</label>
-      <input name="name" type="text" placeholder="e.g. Dr. Maria Santos" required autocomplete="off">
+    <div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
+      border-radius:20px;padding:2rem 1.75rem;text-align:center">
+      <div style="font-size:2.5rem;margin-bottom:1rem">🩺</div>
+      <div style="font-size:1.2rem;font-weight:700;margin-bottom:.5rem">Patient Admission</div>
+      <p style="color:rgba(255,255,255,.35);font-size:.83rem;line-height:1.6;margin-bottom:1.5rem">
+        Submit your appointment form with name, date, time and symptoms.
+      </p>
+      <a href="/patient/admission" style="display:inline-block;
+        background:linear-gradient(135deg,var(--gold),#e8c06a);
+        color:#0a1628;padding:.6rem 1.5rem;border-radius:100px;
+        text-decoration:none;font-size:.83rem;font-weight:700">
+        Book Appointment
+      </a>
     </div>
-    <div class="field">
-      <label>Password</label>
-      <input name="password" type="password" placeholder="Minimum 6 characters" required>
-    </div>
-    <div class="field">
-      <label>Confirm Password</label>
-      <input name="password2" type="password" placeholder="Re-enter password" required>
-    </div>
-    <button class="btn btn-teal btn-block" type="submit">Create Account &amp; Get QR ID</button>
-  </form>
-  <p style="text-align:center;margin-top:1rem;font-size:.82rem;color:var(--text3)">
-    Already registered? <a href="/login" style="color:var(--teal2)">Sign in</a>
-  </p>
-{% endif %}
-
-</div>
-</div>
-{% endblock %}""")
-    return render_template_string(tmpl, title="Register",
-                                  error=error, qr_id=qr_id,
-                                  staff_name=staff_name, staff_role=staff_role)
-
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    error = ""
-    if request.method == "POST":
-        mode = request.form.get("mode","pw")
-        if mode == "pw":
-            name = request.form.get("name","").strip()
-            pw   = request.form.get("password","").strip()
-            with get_db() as c:
-                row = c.execute("SELECT * FROM staff WHERE name=? AND password=?",
-                                (name, hashlib.sha256(pw.encode()).hexdigest())).fetchone()
-            if row:
-                session["staff_id"]   = row["id"]
-                session["staff_name"] = row["name"]
-                session["staff_role"] = row["role"]
-                return redirect(url_for("dashboard"))
-            error = "Incorrect name or password."
-        else:
-            qr = request.form.get("qr_id","").strip()
-            with get_db() as c:
-                row = c.execute("SELECT * FROM staff WHERE qr_id=?",(qr,)).fetchone()
-            if row:
-                session["staff_id"]   = row["id"]
-                session["staff_name"] = row["name"]
-                session["staff_role"] = row["role"]
-                return redirect(url_for("dashboard"))
-            error = "Invalid QR ID."
-
-    tmpl = BASE.replace("{% block content %}{% endblock %}", """
-{% block content %}
-<div class="page">
-<div class="card" style="position:relative;z-index:1">
-  <h2 style="font-size:1.5rem;font-weight:800;margin-bottom:.25rem">Staff Sign In</h2>
-  <p style="color:var(--text2);font-size:.84rem;margin-bottom:1.4rem">Doctors &amp; Nurses only</p>
-
-  <div class="tabs">
-    <button class="tab active" data-tab="pw" onclick="switchTab('pw')">🔑 Password</button>
-    <button class="tab"        data-tab="qr" onclick="switchTab('qr')">📋 QR Code ID</button>
   </div>
+</main>"""
+    return page("Home", body)
 
-  {% if error %}
-  <div class="alert alert-err show">{{ error }}</div>
-  {% endif %}
 
-  <!-- Password tab -->
-  <div class="tab-panel" id="panel-pw">
-    <form method="POST">
-      <input type="hidden" name="mode" value="pw">
-      <div class="field"><label>Full Name</label>
-        <input name="name" type="text" placeholder="e.g. Dr. Admin" required autocomplete="off"></div>
-      <div class="field"><label>Password</label>
-        <input name="password" type="password" placeholder="Enter your password" required></div>
-      <button class="btn btn-teal btn-block" type="submit">Sign In →</button>
-    </form>
+def page_doctor_register(error="", success_qr="", success_name=""):
+    if success_qr:
+        body = f"""
+<nav><span>🏥</span><span class="logo">MediCare</span>
+  <a href="/" class="back">← Home</a></nav>
+<main>
+  <div class="panel" style="text-align:center">
+    <div style="font-size:3.5rem;margin-bottom:1rem">✅</div>
+    <h2>Account Created!</h2>
+    <p class="sub">Your QR code is below — save it to log in via QR scan</p>
+    <div style="background:#fff;border-radius:16px;padding:1.25rem;display:inline-block;margin-bottom:1.25rem">
+      <div id="qrcode"></div>
+    </div>
+    <div style="background:rgba(212,168,83,.1);border:1px solid rgba(212,168,83,.3);
+      border-radius:10px;padding:.9rem;font-size:.8rem;color:rgba(212,168,83,.9);
+      margin-bottom:1.5rem;text-align:left;line-height:1.6">
+      <strong style="display:block;margin-bottom:.3rem">Save your QR code!</strong>
+      Screenshot this QR code now — it is your secure login key.
+    </div>
+    <a href="/doctor/login" class="btn" style="display:block;text-decoration:none;text-align:center">
+      Go to Login
+    </a>
   </div>
-
-  <!-- QR tab -->
-  <div class="tab-panel" id="panel-qr" style="display:none">
-    <form method="POST">
-      <input type="hidden" name="mode" value="qr">
-      <div class="field"><label>QR Code ID</label>
-        <input name="qr_id" type="text" placeholder="Paste your QR ID here" required autocomplete="off"></div>
-      <div class="alert alert-info show" style="font-size:.79rem">
-        📋 Copy the QR ID that was shown when you registered and paste it above.
-      </div>
-      <button class="btn btn-teal btn-block" style="margin-top:.75rem" type="submit">Verify &amp; Sign In →</button>
-    </form>
-  </div>
-
-  <p style="text-align:center;margin-top:1.1rem;font-size:.82rem;color:var(--text3)">
-    No account? <a href="/register" style="color:var(--teal2)">Register here</a>
-    &nbsp;·&nbsp; <a href="/" style="color:var(--text3)">← Home</a>
-  </p>
-</div>
-</div>
-{% endblock %}""")
-    return render_template_string(tmpl, title="Login", error=error)
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("landing"))
-
-
-@app.route("/admission", methods=["GET","POST"])
-def admission():
-    error = ""; success_data = None
-    if request.method == "POST":
-        name = request.form.get("name","").strip()
-        age  = request.form.get("age","").strip()
-        cont = request.form.get("contact","").strip()
-        date = request.form.get("appt_date","").strip()
-        time = request.form.get("appt_time","").strip()
-        syms = request.form.get("symptoms","").strip()
-        if not name: error = "Full name is required."
-        elif not date: error = "Please choose a date."
-        elif not time: error = "Please choose a time."
-        else:
-            try:
-                datetime.strptime(date, "%Y-%m-%d")
-                qno = next_queue(date)
-                with get_db() as c:
-                    c.execute("INSERT INTO patients(name,age,contact,appt_date,appt_time,queue_no,symptoms) VALUES(?,?,?,?,?,?,?)",
-                              (name,age,cont,date,time,qno,syms))
-                    c.commit()
-                success_data = {"name":name,"date":date,"time":time,"queue":qno}
-            except ValueError:
-                error = "Invalid date format. Use YYYY-MM-DD."
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    chips = ["Fever","Cough","Headache","Sore Throat","Stomach Pain",
-             "Dizziness","Fatigue","Rashes","Chest Pain","Shortness of Breath"]
-
-    tmpl = BASE.replace("{% block content %}{% endblock %}", """
-{% block content %}
-<div class="page" style="align-items:flex-start;padding-top:2.5rem">
-<div class="card card-wide" style="position:relative;z-index:1;margin:0 auto">
-
-{% if success_data %}
-  <div style="text-align:center;padding:.5rem 0">
-    <div style="font-size:3.5rem;margin-bottom:.6rem">✅</div>
-    <h2 style="font-size:1.5rem;font-weight:800;margin-bottom:.3rem">Appointment Booked!</h2>
-    <p style="color:var(--text2);font-size:.85rem;margin-bottom:1rem">The doctor will see you when your number is called.</p>
-    <div class="queue-display">
-      <div class="queue-label">Your Queue Number</div>
-      <div class="queue-number">{{ success_data.queue }}</div>
-    </div>
-    <div class="card" style="text-align:left;background:var(--card2);border-color:var(--border2)">
-      <div class="info-row"><span class="info-lbl">Patient</span><span class="info-val">{{ success_data.name }}</span></div>
-      <div class="info-row"><span class="info-lbl">Date</span><span class="info-val">{{ success_data.date }}</span></div>
-      <div class="info-row"><span class="info-lbl">Time</span><span class="info-val">{{ success_data.time }}</span></div>
-    </div>
-    <a href="/admission" class="btn btn-ghost btn-block" style="margin-top:.8rem">Book Another</a>
-    <a href="/"          class="btn btn-teal  btn-block" style="margin-top:.5rem">← Back to Home</a>
-  </div>
-
-{% else %}
-  <h2 style="font-size:1.5rem;font-weight:800;margin-bottom:.25rem">🩺 Admission Form</h2>
-  <p style="color:var(--text2);font-size:.84rem;margin-bottom:1.5rem">Choose your preferred date &amp; time — a queue number is assigned automatically</p>
-
-  {% if error %}
-  <div class="alert alert-err show">{{ error }}</div>
-  {% endif %}
-
-  <form method="POST">
-    <div class="field"><label>Full Name *</label>
-      <input name="name" type="text" placeholder="Your full name" required></div>
-    <div class="grid2">
-      <div class="field"><label>Age</label>
-        <input name="age" type="number" placeholder="e.g. 25" min="0" max="120"></div>
-      <div class="field"><label>Contact No.</label>
-        <input name="contact" type="text" placeholder="09XXXXXXXXX"></div>
-    </div>
-    <div class="grid2">
-      <div class="field"><label>Preferred Date *</label>
-        <input name="appt_date" type="date" min="{{ today }}" value="{{ today }}" required></div>
-      <div class="field"><label>Preferred Time *</label>
-        <select name="appt_time" required>
-          {% for h in range(8,18) %}
-            {% for m in ['00','30'] %}
-              {% set ampm = 'AM' if h < 12 else 'PM' %}
-              {% set h12  = h if h <= 12 else h-12 %}
-              <option value="{{ '%02d'|format(h) }}:{{ m }} {{ ampm }}">{{ '%02d'|format(h12) }}:{{ m }} {{ ampm }}</option>
-            {% endfor %}
-          {% endfor %}
-        </select>
-      </div>
-    </div>
-    <div class="field">
-      <label>Symptoms / Reason</label>
-      <div class="chip-row" id="chips">
-        {% for chip in chips %}
-        <span class="chip" onclick="toggleChip(this,'{{ chip }}')">{{ chip }}</span>
-        {% endfor %}
-      </div>
-      <textarea name="symptoms" id="syms" rows="3" placeholder="Describe your symptoms..."></textarea>
-    </div>
-    <button class="btn btn-gold btn-block" type="submit">Submit Appointment Request</button>
-  </form>
-  <p style="text-align:center;margin-top:1rem;font-size:.82rem;color:var(--text3)">
-    <a href="/" style="color:var(--text3)">← Back to Home</a>
-  </p>
-{% endif %}
-
-</div>
-</div>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
-var picked = new Set();
-function toggleChip(el, val) {
-  if (picked.has(val)) { picked.delete(val); el.classList.remove('selected'); }
-  else                 { picked.add(val);    el.classList.add('selected'); }
-  var ta = document.getElementById('syms');
-  var manual = ta.value.split('\\n').filter(function(l){ return !Array.from(picked).includes(l.trim()) && l.trim(); });
-  ta.value = Array.from(picked).concat(manual).join('\\n');
-}
-</script>
-{% endblock %}""")
-    return render_template_string(tmpl, title="Admission",
-                                  error=error, success_data=success_data,
-                                  today=today, chips=chips)
+new QRCode(document.getElementById("qrcode"),{{
+  text:"{success_qr}",width:200,height:200,
+  colorDark:"#0a1628",colorLight:"#ffffff",
+  correctLevel:QRCode.CorrectLevel.H
+}});
+</script>"""
+        return page("Registered", body)
 
-
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    flt = request.args.get("f","All")
-    with get_db() as c:
-        all_p = [dict(r) for r in c.execute(
-            "SELECT * FROM patients ORDER BY appt_date ASC, queue_no ASC").fetchall()]
-    counts = {"Waiting":0,"In Progress":0,"Done Appointing":0,"Cancelled":0}
-    for p in all_p:
-        if p["status"] in counts: counts[p["status"]] += 1
-
-    def badge_class(s):
-        return {"Waiting":"badge-wait","In Progress":"badge-prog",
-                "Done Appointing":"badge-done","Cancelled":"badge-canc"}.get(s,"badge-wait")
-    def sym_short(s, n=3):
-        parts = [x.strip() for x in re.split(r'[\n,]+', s) if x.strip()]
-        tags  = "".join(f'<span class="stag">{p}</span>' for p in parts[:n])
-        if len(parts) > n: tags += f'<span class="stag" style="opacity:.5">+{len(parts)-n}</span>'
-        return tags
-
-    tmpl = BASE.replace("{% block content %}{% endblock %}", """
-{% block content %}
-<div class="dash-wrap">
-
-  <!-- Sidebar -->
-  <aside class="sidebar">
-    <div class="sb-head">
-      <div class="sb-role">{{ session.staff_role }}</div>
-      <div class="sb-name">{{ session.staff_name }}</div>
-    </div>
-    <nav class="sb-nav">
-      <a class="sb-link {% if flt=='All' %}active{% endif %}" href="/dashboard?f=All">
-        📋 All Patients <span class="sb-count">{{ all_p|length }}</span>
-      </a>
-      <a class="sb-link {% if flt=='Waiting' %}active{% endif %}" href="/dashboard?f=Waiting">
-        🟡 Waiting <span class="sb-count gold">{{ counts.Waiting }}</span>
-      </a>
-      <a class="sb-link {% if flt=='In Progress' %}active{% endif %}" href="/dashboard?f=In Progress">
-        🔵 In Progress
-      </a>
-      <a class="sb-link {% if flt=='Done Appointing' %}active{% endif %}" href="/dashboard?f=Done Appointing">
-        ✅ Done Appointing
-      </a>
-      <a class="sb-link {% if flt=='Cancelled' %}active{% endif %}" href="/dashboard?f=Cancelled">
-        ❌ Cancelled
-      </a>
-    </nav>
-    <div class="sb-foot">
-      <a href="/logout" class="btn btn-ghost btn-sm btn-block">🚪 Sign Out</a>
-    </div>
-  </aside>
-
-  <!-- Main -->
-  <main class="main-content">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.2rem;flex-wrap:wrap;gap:.6rem">
-      <h1 style="font-size:1.4rem;font-weight:800">Patient Queue</h1>
-      <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
-        <input class="search-input" id="srch" type="text" placeholder="Search patient..." oninput="doSearch()">
-        <a href="/dashboard" class="btn btn-ghost btn-sm">↻ Refresh</a>
+    err_html = f'<div class="msg error" style="display:block">{error}</div>' if error else ""
+    body = f"""
+<nav><span>🏥</span><span class="logo">MediCare</span>
+  <a href="/" class="back">← Home</a></nav>
+<main>
+  <div class="panel">
+    <div class="picon">📋</div>
+    <h2>Create Account</h2>
+    <p class="sub">Register as a doctor — a unique QR ID will be generated</p>
+    {err_html}
+    <form method="POST" action="/doctor/register">
+      <div class="field">
+        <label>Full Name</label>
+        <input name="name" type="text" placeholder="e.g. Dr. Maria Santos" required autocomplete="off">
       </div>
-    </div>
-
-    <!-- Stats -->
-    <div class="stats">
-      <div class="stat teal">
-        <div class="stat-val">{{ all_p|length }}</div>
-        <div class="stat-lbl">Total</div>
+      <div class="field">
+        <label>Password</label>
+        <input name="password" type="password" placeholder="At least 6 characters" required>
       </div>
-      <div class="stat gold">
-        <div class="stat-val">{{ counts.Waiting }}</div>
-        <div class="stat-lbl">Waiting</div>
-      </div>
-      <div class="stat teal">
-        <div class="stat-val">{{ counts['In Progress'] }}</div>
-        <div class="stat-lbl">In Progress</div>
-      </div>
-      <div class="stat green">
-        <div class="stat-val">{{ counts['Done Appointing'] }}</div>
-        <div class="stat-lbl">Done</div>
-      </div>
-      <div class="stat red">
-        <div class="stat-val">{{ counts.Cancelled }}</div>
-        <div class="stat-lbl">Cancelled</div>
-      </div>
-    </div>
-
-    <!-- Table -->
-    <div class="table-wrap">
-      <div class="table-top">
-        <span class="table-title">Appointments</span>
-        <div class="filter-row">
-          <button class="fbtn {% if flt=='All'            %}active{% endif %}" data-filter=""               onclick="filterTable('',this)">All</button>
-          <button class="fbtn {% if flt=='Waiting'        %}active{% endif %}" data-filter="Waiting"        onclick="filterTable('Waiting',this)">Waiting</button>
-          <button class="fbtn {% if flt=='In Progress'    %}active{% endif %}" data-filter="In Progress"    onclick="filterTable('In Progress',this)">In Progress</button>
-          <button class="fbtn {% if flt=='Done Appointing'%}active{% endif %}" data-filter="Done Appointing"onclick="filterTable('Done Appointing',this)">Done</button>
-          <button class="fbtn {% if flt=='Cancelled'      %}active{% endif %}" data-filter="Cancelled"      onclick="filterTable('Cancelled',this)">Cancelled</button>
-        </div>
-      </div>
-      <div style="overflow-x:auto">
-      <table>
-        <thead><tr>
-          <th>Queue</th><th>Patient</th><th>Date</th><th>Time</th><th>Symptoms</th><th>Status</th><th>Action</th>
-        </tr></thead>
-        <tbody>
-        {% if all_p %}
-          {% for p in all_p %}
-          {% if flt == 'All' or p.status == flt %}
-          <tr data-status="{{ p.status }}" data-name="{{ p.name }}" data-queue="{{ p.queue_no }}">
-            <td class="td-queue">#{{ p.queue_no }}</td>
-            <td class="td-name">{{ p.name }}<br>
-              <span style="font-size:.74rem;color:var(--text2);font-weight:400">{{ p.age }}{% if p.age and p.contact %} · {% endif %}{{ p.contact }}</span>
-            </td>
-            <td style="font-size:.82rem;color:var(--text2)">{{ p.appt_date }}</td>
-            <td style="font-size:.82rem;color:var(--text2)">{{ p.appt_time }}</td>
-            <td>{{ sym_short(p.symptoms)|safe }}</td>
-            <td><span class="badge {{ badge_class(p.status) }}">{{ p.status }}</span></td>
-            <td>
-              <div class="action-btns">
-                <a href="/examine/{{ p.id }}" class="btn btn-teal btn-sm">Examine</a>
-              </div>
-            </td>
-          </tr>
-          {% endif %}
-          {% endfor %}
-        {% else %}
-          <tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--text3)">
-            No patients yet. Share the admission link with patients.
-          </td></tr>
-        {% endif %}
-        </tbody>
-      </table>
-      </div>
-    </div>
-  </main>
-</div>
-{% endblock %}""")
-    return render_template_string(tmpl, title="Dashboard",
-                                  all_p=all_p, counts=counts, flt=flt,
-                                  badge_class=badge_class, sym_short=sym_short)
-
-
-@app.route("/examine/<int:pid>", methods=["GET","POST"])
-@login_required
-def examine(pid):
-    error = ""; saved = ""
-    with get_db() as c:
-        patient = dict(c.execute("SELECT * FROM patients WHERE id=?",(pid,)).fetchone())
-
-    if request.method == "POST":
-        action   = request.form.get("action","save")
-        diag     = request.form.get("diagnosis","").strip()
-        notes    = request.form.get("notes","").strip()
-        status   = "Done Appointing" if action == "done" else \
-                   "Cancelled"       if action == "cancel" else "In Progress"
-        if action in ("done","save") and not diag:
-            error = "Diagnosis is required."
-        else:
-            with get_db() as c:
-                c.execute("UPDATE patients SET diagnosis=?,notes=?,status=?,examined_by=? WHERE id=?",
-                          (diag, notes, status, session["staff_name"], pid))
-                c.commit()
-                patient = dict(c.execute("SELECT * FROM patients WHERE id=?",(pid,)).fetchone())
-            if action == "done" or action == "cancel":
-                return redirect(url_for("dashboard"))
-            saved = "Saved — marked as In Progress."
-
-    def sym_tags(s):
-        parts = [x.strip() for x in re.split(r'[\n,]+',s) if x.strip()]
-        return "".join(f'<span class="stag">{p}</span>' for p in parts)
-
-    tmpl = BASE.replace("{% block content %}{% endblock %}", """
-{% block content %}
-<div style="position:relative;z-index:1;padding:1.5rem;max-width:1100px;margin:0 auto">
-
-  <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap">
-    <a href="/dashboard" class="btn btn-ghost btn-sm">← Dashboard</a>
-    <h1 style="font-size:1.3rem;font-weight:800">Patient Examination</h1>
-    <span class="badge badge-wait" style="font-family:var(--mono);font-size:.85rem">Queue #{{ patient.queue_no }}</span>
+      <button class="btn" type="submit">Create Account &amp; Get QR</button>
+    </form>
+    <p style="text-align:center;margin-top:1.25rem;font-size:.83rem;color:rgba(255,255,255,.3)">
+      Already have an account? <a href="/doctor/login" style="color:var(--teal-light)">Sign in</a>
+    </p>
   </div>
+</main>"""
+    return page("Register", body)
 
-  <div class="exam-grid">
 
-    <!-- Left: Patient Info -->
-    <div>
-      <div class="card" style="margin-bottom:1rem">
-        <h3 style="font-size:.8rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text2);margin-bottom:1rem">Patient Information</h3>
-        <div class="info-row"><span class="info-lbl">Name</span>     <span class="info-val">{{ patient.name }}</span></div>
-        <div class="info-row"><span class="info-lbl">Age</span>      <span class="info-val">{{ patient.age or '—' }}</span></div>
-        <div class="info-row"><span class="info-lbl">Contact</span>  <span class="info-val">{{ patient.contact or '—' }}</span></div>
-        <div class="info-row"><span class="info-lbl">Queue #</span>  <span class="info-val" style="font-family:var(--mono);font-size:1.1rem;color:var(--teal2)">#{{ patient.queue_no }}</span></div>
-        <div class="info-row"><span class="info-lbl">Date</span>     <span class="info-val">{{ patient.appt_date }}</span></div>
-        <div class="info-row"><span class="info-lbl">Time</span>     <span class="info-val">{{ patient.appt_time }}</span></div>
-        <div class="info-row"><span class="info-lbl">Status</span>
-          <span class="badge {{ badge_class(patient.status) }}">{{ patient.status }}</span>
+def page_doctor_login(error=""):
+    err_html = f'<div class="msg error" style="display:block">{error}</div>' if error else ""
+    body = f"""
+<nav><span>🏥</span><span class="logo">MediCare</span>
+  <a href="/" class="back">← Home</a></nav>
+<main>
+  <div class="panel">
+    <div class="picon">👨‍⚕️</div>
+    <h2>Doctor Sign In</h2>
+    <p class="sub">Access your clinic dashboard</p>
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('pw',this)">🔑 Password</button>
+      <button class="tab" onclick="switchTab('qr',this)">📷 QR Scan</button>
+    </div>
+    <div id="tab-pw">
+      {err_html}
+      <form method="POST" action="/doctor/login">
+        <div class="field">
+          <label>Full Name</label>
+          <input name="name" type="text" placeholder="e.g. Dr. Admin" required autocomplete="off">
         </div>
-        {% if patient.examined_by %}
-        <div class="info-row"><span class="info-lbl">Seen by</span> <span class="info-val" style="color:var(--teal2)">{{ patient.examined_by }}</span></div>
-        {% endif %}
+        <div class="field">
+          <label>Password</label>
+          <input name="password" type="password" placeholder="Enter your password" required>
+        </div>
+        <button class="btn" type="submit">Sign In to Dashboard</button>
+      </form>
+    </div>
+    <div id="tab-qr" class="hidden">
+      <div style="background:rgba(13,148,136,.08);border:1px solid rgba(13,148,136,.15);
+        border-radius:10px;padding:.75rem;font-size:.8rem;color:rgba(255,255,255,.35);
+        text-align:center;margin-bottom:1rem">
+        📋 Show your QR code to the camera
       </div>
-      <div class="card">
-        <h3 style="font-size:.8rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text2);margin-bottom:.75rem">Symptoms</h3>
-        <div>{{ sym_tags(patient.symptoms)|safe }}</div>
-        {% if not patient.symptoms %}
-        <p style="color:var(--text3);font-size:.83rem">None reported</p>
-        {% endif %}
+      <div id="qr-reader" style="width:100%;border-radius:12px;overflow:hidden"></div>
+      <div id="qr-status" class="msg" style="margin-top:.75rem"></div>
+    </div>
+  </div>
+</main>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+let scanner=null;
+function switchTab(tab,btn){{
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('tab-pw').classList.toggle('hidden',tab!=='pw');
+  document.getElementById('tab-qr').classList.toggle('hidden',tab!=='qr');
+  if(tab==='qr') startQR(); else stopQR();
+}}
+function startQR(){{
+  if(scanner) return;
+  scanner=new Html5Qrcode("qr-reader");
+  scanner.start({{facingMode:"environment"}},{{fps:10,qrbox:{{width:240,height:240}}}},
+    async(text)=>{{
+      stopQR();
+      const st=document.getElementById('qr-status');
+      st.className='msg success';st.style.display='block';st.textContent='Verifying...';
+      const r=await fetch('/doctor/qr-verify',{{method:'POST',
+        headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{qr_id:text}})}});
+      const d=await r.json();
+      if(d.success){{st.textContent='Welcome '+d.name+'! Redirecting...';
+        setTimeout(()=>location.href='/doctor/dashboard',1000);}}
+      else{{st.className='msg error';st.textContent='Invalid QR';
+        setTimeout(startQR,2000);}}
+    }},()=>{{}}).catch(()=>{{
+      const st=document.getElementById('qr-status');
+      st.className='msg error';st.style.display='block';
+      st.textContent='Camera unavailable. Use password login.';
+    }});
+}}
+function stopQR(){{
+  if(scanner){{scanner.stop().catch(()=>{{}});scanner=null;}}
+}}
+</script>"""
+    return page("Login", body)
+
+
+def page_patient_admission(error=""):
+    err_html = f'<div class="msg error" style="display:block">{error}</div>' if error else ""
+    today = datetime.now().strftime("%Y-%m-%d")
+    body = f"""
+<nav><span>🏥</span><span class="logo">MediCare</span>
+  <a href="/" class="back">← Home</a></nav>
+<main>
+  <div class="panel" style="max-width:520px">
+    <div class="picon" style="background:linear-gradient(135deg,rgba(212,168,83,.25),rgba(212,168,83,.05));
+      border-color:rgba(212,168,83,.3)">🩺</div>
+    <h2>Admission Form</h2>
+    <p class="sub">Fill in your details to book an appointment</p>
+    {err_html}
+    <form method="POST" action="/patient/admission">
+      <div class="field">
+        <label>Full Name *</label>
+        <input name="name" type="text" placeholder="Enter your full name" required>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>Date *</label>
+          <input name="date" type="date" min="{today}" value="{today}" required>
+        </div>
+        <div class="field">
+          <label>Time *</label>
+          <input name="time" type="time" value="09:00" required>
+        </div>
+      </div>
+      <div class="field">
+        <label>Symptoms *</label>
+        <div id="chips" style="display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.6rem"></div>
+        <textarea name="symptoms" id="syms" placeholder="Describe your symptoms..." rows="3" required></textarea>
+      </div>
+      <button class="btn btn-gold" type="submit">Submit Appointment</button>
+    </form>
+  </div>
+</main>
+<script>
+const COMMON=['Fever','Cough','Headache','Sore Throat','Stomach Pain','Dizziness','Fatigue','Rashes','Chest Pain','Shortness of Breath'];
+const sel=new Set();
+const chips=document.getElementById('chips');
+COMMON.forEach(s=>{{
+  const b=document.createElement('button');b.type='button';
+  b.textContent=s;b.style.cssText='padding:.3rem .8rem;border-radius:100px;font-size:.75rem;cursor:pointer;border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.45);background:transparent;transition:all .2s;font-family:inherit';
+  b.onclick=()=>{{
+    const on=sel.has(s);
+    if(on){{sel.delete(s);b.style.background='transparent';b.style.color='rgba(255,255,255,.45)';b.style.borderColor='rgba(255,255,255,.15)';}}
+    else{{sel.add(s);b.style.background='rgba(212,168,83,.15)';b.style.color='#d4a853';b.style.borderColor='rgba(212,168,83,.4)';}}
+    const ta=document.getElementById('syms');
+    const manual=ta.value.split('\\n').filter(l=>!COMMON.includes(l.trim())&&l.trim());
+    ta.value=[...sel,...manual].join('\\n');
+  }};
+  chips.appendChild(b);
+}});
+</script>"""
+    return page("Admission", body)
+
+
+def page_patient_success(name, date, time_val, symptoms):
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").strftime("%B %d, %Y")
+    except Exception:
+        d = date
+    try:
+        t = datetime.strptime(time_val, "%H:%M").strftime("%I:%M %p")
+    except Exception:
+        t = time_val
+    sym_tags = "".join(
+        f'<span style="display:inline-block;background:rgba(13,148,136,.12);border:1px solid rgba(13,148,136,.2);color:var(--teal-light);font-size:.72rem;padding:.2rem .6rem;border-radius:100px;margin:.15rem">{s.strip()}</span>'
+        for s in re.split(r'[\n,]+', symptoms) if s.strip()
+    )
+    body = f"""
+<nav><span>🏥</span><span class="logo">MediCare</span>
+  <a href="/" class="back">← Home</a></nav>
+<main>
+  <div class="panel" style="text-align:center">
+    <div style="font-size:3.5rem;margin-bottom:1rem">✅</div>
+    <h2>Appointment Booked!</h2>
+    <p class="sub">Your form has been submitted. The doctor will see your request shortly.</p>
+    <div style="background:rgba(13,148,136,.08);border:1px solid rgba(13,148,136,.2);
+      border-radius:14px;padding:1.25rem;margin:1.25rem 0;text-align:left">
+      <div style="display:flex;justify-content:space-between;padding:.45rem 0;border-bottom:1px solid rgba(255,255,255,.06);font-size:.85rem">
+        <span style="color:rgba(255,255,255,.4)">Patient</span><span style="font-weight:600">{name}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:.45rem 0;border-bottom:1px solid rgba(255,255,255,.06);font-size:.85rem">
+        <span style="color:rgba(255,255,255,.4)">Date</span><span>{d}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:.45rem 0;border-bottom:1px solid rgba(255,255,255,.06);font-size:.85rem">
+        <span style="color:rgba(255,255,255,.4)">Time</span><span>{t}</span>
+      </div>
+      <div style="padding:.45rem 0;font-size:.85rem">
+        <div style="color:rgba(255,255,255,.4);margin-bottom:.4rem">Symptoms</div>
+        <div>{sym_tags}</div>
+      </div>
+    </div>
+    <a href="/" class="btn" style="display:block;text-decoration:none;text-align:center">Back to Home</a>
+  </div>
+</main>"""
+    return page("Booked", body)
+
+
+# ─────────────────────────────────────────────
+#  PATIENT EXAMINE PAGE
+# ─────────────────────────────────────────────
+def page_examine(doctor_name, patient, success=False):
+    p = patient
+    try:
+        d = datetime.strptime(p["date_of_appointment"], "%Y-%m-%d").strftime("%B %d, %Y")
+    except Exception:
+        d = p["date_of_appointment"]
+    try:
+        t = datetime.strptime(p["appointment_time"], "%H:%M").strftime("%I:%M %p")
+    except Exception:
+        t = p["appointment_time"]
+
+    syms = [s.strip() for s in re.split(r'[\n,]+', p["symptoms"]) if s.strip()]
+    sym_tags = "".join(
+        f'<span style="display:inline-block;background:rgba(212,168,83,.12);border:1px solid rgba(212,168,83,.25);color:var(--gold);font-size:.75rem;padding:.22rem .65rem;border-radius:100px;margin:.15rem">{s}</span>'
+        for s in syms
+    )
+
+    is_examined = p["status"] == "Examined"
+    diagnosis_val    = p.get("diagnosis") or ""
+    prescription_val = p.get("prescription") or ""
+    notes_val        = p.get("notes") or ""
+    examined_at      = p.get("examined_at") or ""
+
+    banner = ""
+    if success:
+        banner = """
+        <div style="background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);
+          border-radius:12px;padding:1rem 1.25rem;margin-bottom:1.5rem;display:flex;align-items:center;gap:.75rem">
+          <span style="font-size:1.4rem">✅</span>
+          <div>
+            <div style="font-weight:600;color:#86efac;font-size:.95rem">Examination Saved!</div>
+            <div style="color:rgba(255,255,255,.4);font-size:.8rem">Patient status is now Examined. Receipt is ready below.</div>
+          </div>
+        </div>"""
+
+    # Receipt (shown after examination)
+    receipt_section = ""
+    if is_examined and diagnosis_val:
+        sym_receipt = "".join(
+            f'<span style="display:inline-block;background:rgba(13,148,136,.12);border:1px solid rgba(13,148,136,.2);color:var(--teal-light);font-size:.75rem;padding:.22rem .65rem;border-radius:100px;margin:.15rem">{s}</span>'
+            for s in syms
+        )
+        notes_block = ""
+        if notes_val:
+            notes_block = f"""
+            <div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:.9rem">
+              <div style="font-size:.72rem;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.35rem">Doctor Notes</div>
+              <div style="font-size:.83rem;white-space:pre-line">{notes_val}</div>
+            </div>"""
+        receipt_section = f"""
+        <div id="receipt-section" style="margin-top:2rem">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
+            <div style="font-size:1rem;font-weight:700;color:var(--teal-light)">🧾 Medical Receipt</div>
+            <button onclick="window.print()" class="no-print"
+              style="padding:.4rem .9rem;border-radius:8px;font-size:.78rem;cursor:pointer;
+                border:1px solid rgba(13,148,136,.4);background:rgba(13,148,136,.12);
+                color:var(--teal-light);font-family:inherit">
+              🖨 Print Receipt
+            </button>
+          </div>
+          <div id="receipt-card" style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:1.5rem;display:flex;flex-direction:column;gap:.75rem">
+            <div style="text-align:center;border-bottom:1px solid rgba(255,255,255,.08);padding-bottom:1rem">
+              <div style="font-size:1.3rem;font-weight:700">🏥 MediCare Clinic</div>
+              <div style="font-size:.75rem;color:rgba(255,255,255,.35);margin-top:.2rem">Official Medical Receipt</div>
+              <div style="font-size:.72rem;color:rgba(255,255,255,.25);margin-top:.2rem">Examined: {examined_at}</div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;font-size:.84rem">
+              <div><span style="color:rgba(255,255,255,.4)">Patient:</span> <strong>{p['name']}</strong></div>
+              <div><span style="color:rgba(255,255,255,.4)">Date:</span> {d}</div>
+              <div><span style="color:rgba(255,255,255,.4)">Time:</span> {t}</div>
+              <div><span style="color:rgba(255,255,255,.4)">Doctor:</span> {doctor_name}</div>
+            </div>
+            <div style="background:rgba(212,168,83,.07);border:1px solid rgba(212,168,83,.15);border-radius:10px;padding:.9rem">
+              <div style="font-size:.72rem;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.4rem">Symptoms Reported</div>
+              {sym_receipt}
+            </div>
+            <div style="background:rgba(13,148,136,.07);border:1px solid rgba(13,148,136,.15);border-radius:10px;padding:.9rem">
+              <div style="font-size:.72rem;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.35rem">Diagnosis</div>
+              <div style="font-size:.88rem;font-weight:500">{diagnosis_val}</div>
+            </div>
+            <div style="background:rgba(139,92,246,.07);border:1px solid rgba(139,92,246,.15);border-radius:10px;padding:.9rem">
+              <div style="font-size:.72rem;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.35rem">Prescription</div>
+              <div style="font-size:.83rem;white-space:pre-line">{prescription_val}</div>
+            </div>
+            {notes_block}
+            <div style="text-align:center;padding-top:.75rem;border-top:1px solid rgba(255,255,255,.07);font-size:.72rem;color:rgba(255,255,255,.2)">
+              Thank you for trusting MediCare Clinic · Keep this receipt for your records
+            </div>
+          </div>
+        </div>"""
+
+    # Form state
+    readonly = 'readonly' if is_examined else ''
+    form_style = 'opacity:.65;pointer-events:none' if is_examined else ''
+    status_badge = (
+        '<span style="background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.3);color:#86efac;padding:.35rem .9rem;border-radius:100px;font-size:.78rem;font-weight:600">✅ Examined</span>'
+        if is_examined else
+        '<span style="background:rgba(212,168,83,.15);border:1px solid rgba(212,168,83,.3);color:var(--gold);padding:.35rem .9rem;border-radius:100px;font-size:.78rem;font-weight:600">🟡 Pending</span>'
+    )
+    save_btn = (
+        '<div style="text-align:center;padding:.75rem;background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.2);border-radius:10px;color:#86efac;font-size:.85rem">✅ Examination already completed</div>'
+        if is_examined else
+        '<button type="submit" style="width:100%;padding:.9rem;border:none;border-radius:12px;cursor:pointer;font-size:.95rem;font-weight:700;font-family:inherit;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;transition:opacity .2s" onmouseover="this.style.opacity=\'.85\'" onmouseout="this.style.opacity=\'1\'">✅ Save Examination &amp; Generate Receipt</button>'
+    )
+
+    body = f"""
+<style>
+.exam-wrap{{min-height:100vh;padding-top:70px}}
+.exam-content{{max-width:860px;margin:0 auto;padding:1.75rem 1.25rem 3rem}}
+.info-card{{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:1.25rem 1.5rem;margin-bottom:1.5rem}}
+.form-card{{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:1.5rem}}
+.section-title{{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.35);margin-bottom:.85rem;font-weight:500}}
+.field-inner{{width:100%;padding:.8rem 1rem;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:12px;color:#fff;font-size:.92rem;outline:none;font-family:inherit;transition:border-color .2s}}
+.field-inner:focus{{border-color:var(--teal)}}
+.field-inner::placeholder{{color:rgba(255,255,255,.2)}}
+textarea.field-inner{{resize:vertical}}
+@media print{{
+  .no-print{{display:none!important}}
+  body{{background:#fff!important;color:#000!important}}
+  .bg,.grid{{display:none!important}}
+  #receipt-card{{background:#fff!important;border:1px solid #ccc!important}}
+  #receipt-card *{{color:#000!important;border-color:#ccc!important;background:transparent!important}}
+  .exam-wrap{{padding-top:0!important}}
+}}
+</style>
+
+<nav class="no-print">
+  <span>🏥</span><span class="logo">MediCare</span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:.75rem">
+    <span style="font-size:.82rem;color:rgba(255,255,255,.35)">👨‍⚕️ {doctor_name}</span>
+    <a href="/doctor/dashboard"
+      style="background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);
+        color:rgba(255,255,255,.7);padding:.45rem 1.1rem;border-radius:100px;
+        text-decoration:none;font-size:.83rem;font-weight:500;transition:all .2s"
+      onmouseover="this.style.background='rgba(13,148,136,.2)';this.style.color='var(--teal-light)'"
+      onmouseout="this.style.background='rgba(255,255,255,.07)';this.style.color='rgba(255,255,255,.7)'">
+      ← Back to Dashboard
+    </a>
+  </div>
+</nav>
+
+<div class="exam-wrap">
+  <div class="exam-content">
+
+    <!-- Header -->
+    <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap" class="no-print">
+      <div style="width:48px;height:48px;background:linear-gradient(135deg,rgba(13,148,136,.3),rgba(13,148,136,.08));
+        border:1px solid rgba(13,148,136,.35);border-radius:14px;display:flex;align-items:center;
+        justify-content:center;font-size:1.4rem;flex-shrink:0">🩺</div>
+      <div style="flex:1;min-width:180px">
+        <div style="font-size:1.4rem;font-weight:700">Patient Examination</div>
+        <div style="font-size:.82rem;color:rgba(255,255,255,.35)">Fill in diagnosis and prescription, then save</div>
+      </div>
+      <div>{status_badge}</div>
+    </div>
+
+    {banner}
+
+    <!-- Patient Info -->
+    <div class="info-card no-print">
+      <div class="section-title">Patient Information</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem;margin-bottom:.9rem">
+        <div style="font-size:.85rem"><span style="color:rgba(255,255,255,.35)">Name:</span> <strong>{p['name']}</strong></div>
+        <div style="font-size:.85rem"><span style="color:rgba(255,255,255,.35)">Date:</span> {d}</div>
+        <div style="font-size:.85rem"><span style="color:rgba(255,255,255,.35)">Time:</span> {t}</div>
+        <div style="font-size:.85rem"><span style="color:rgba(255,255,255,.35)">Patient ID:</span> #{p['id']}</div>
+      </div>
+      <div>
+        <div style="font-size:.72rem;color:rgba(255,255,255,.3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.45rem">Reported Symptoms</div>
+        <div>{sym_tags}</div>
       </div>
     </div>
 
-    <!-- Right: Examination Form -->
-    <div class="card">
-      <h3 style="font-size:.8rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text2);margin-bottom:1.2rem">📝 Doctor's Examination</h3>
-
-      {% if error %}<div class="alert alert-err show">{{ error }}</div>{% endif %}
-      {% if saved  %}<div class="alert alert-ok  show">{{ saved }}</div>{% endif %}
-
-      <form method="POST">
-        <div class="field">
-          <label>Diagnosis *</label>
-          <input name="diagnosis" type="text" placeholder="Enter diagnosis" value="{{ patient.diagnosis }}" required>
+    <!-- Examination Form -->
+    <div class="form-card no-print" style="{form_style}">
+      <div class="section-title">Checkup Details</div>
+      <form method="POST" action="/doctor/patient/{p['id']}/examine">
+        <div style="margin-bottom:1.1rem">
+          <label style="display:block;font-size:.75rem;color:rgba(255,255,255,.45);margin-bottom:.45rem;letter-spacing:.06em;text-transform:uppercase">
+            Diagnosis *
+          </label>
+          <input name="diagnosis" type="text" class="field-inner"
+            value="{diagnosis_val}"
+            placeholder="e.g. Viral Upper Respiratory Tract Infection"
+            required {readonly}>
         </div>
-        <div class="field">
-          <label>Description / Notes</label>
-          <textarea name="notes" rows="7" placeholder="Treatment plan, prescriptions, observations...">{{ patient.notes }}</textarea>
+        <div style="margin-bottom:1.1rem">
+          <label style="display:block;font-size:.75rem;color:rgba(255,255,255,.45);margin-bottom:.45rem;letter-spacing:.06em;text-transform:uppercase">
+            Prescription *
+          </label>
+          <textarea name="prescription" rows="4" class="field-inner" required {readonly}
+            placeholder="e.g. Paracetamol 500mg — 1 tablet every 6 hours&#10;Vitamin C 500mg — 1 tablet once daily&#10;Rest for 3 days">{prescription_val}</textarea>
         </div>
-
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.6rem">
-          <button class="btn btn-teal"  type="submit" name="action" value="save">💾 Save Progress</button>
-          <button class="btn btn-green" type="submit" name="action" value="done"
-                  onclick="return confirm('Mark as Done Appointing?')">✅ Done Examining</button>
+        <div style="margin-bottom:1.5rem">
+          <label style="display:block;font-size:.75rem;color:rgba(255,255,255,.45);margin-bottom:.45rem;letter-spacing:.06em;text-transform:uppercase">
+            Doctor Notes <span style="color:rgba(255,255,255,.2);font-size:.7rem">(optional)</span>
+          </label>
+          <textarea name="notes" rows="2" class="field-inner" {readonly}
+            placeholder="Follow-up instructions, schedule, warnings...">{notes_val}</textarea>
         </div>
-        <button class="btn btn-red btn-block" type="submit" name="action" value="cancel"
-                onclick="return confirm('Cancel this appointment?')">✖ Cancel Appointment</button>
+        {save_btn}
       </form>
     </div>
 
+    {receipt_section}
+
+  </div>
+</div>"""
+    return page(f"Examine — {p['name']}", body)
+
+
+# ─────────────────────────────────────────────
+#  STATISTICS PAGE
+# ─────────────────────────────────────────────
+def page_statistics(doctor_name, patients):
+    import collections as _col
+    total     = len(patients)
+    examined  = sum(1 for p in patients if p["status"] == "Examined")
+    pending   = sum(1 for p in patients if p["status"] == "Pending")
+    confirmed = sum(1 for p in patients if p["status"] == "Confirmed")
+    cancelled = sum(1 for p in patients if p["status"] == "Cancelled")
+
+    # Monthly admissions
+    monthly = _col.Counter()
+    for p in patients:
+        try:
+            m = datetime.strptime(p["submitted_at"][:10], "%Y-%m-%d").strftime("%b")
+            monthly[m] += 1
+        except Exception:
+            pass
+    months_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    monthly_vals = [monthly.get(m, 0) for m in months_order]
+
+    # Status by month
+    ex_monthly   = _col.Counter()
+    pend_monthly = _col.Counter()
+    for p in patients:
+        try:
+            m = datetime.strptime(p["submitted_at"][:10], "%Y-%m-%d").strftime("%b")
+            if p["status"] == "Examined": ex_monthly[m] += 1
+            elif p["status"] == "Pending": pend_monthly[m] += 1
+        except Exception:
+            pass
+    ex_vals   = [ex_monthly.get(m, 0) for m in months_order]
+    pend_vals = [pend_monthly.get(m, 0) for m in months_order]
+
+    # Top symptoms
+    sym_counter = _col.Counter()
+    for p in patients:
+        for s in re.split(r'[\n,]+', p["symptoms"]):
+            s = s.strip()
+            if s: sym_counter[s] += 1
+    top_syms = sym_counter.most_common(8)
+    sym_labels = json.dumps([x[0] for x in top_syms])
+    sym_vals   = json.dumps([x[1] for x in top_syms])
+
+    # Top diagnoses
+    diag_counter = _col.Counter()
+    for p in patients:
+        if p["status"] == "Examined" and p.get("diagnosis","").strip():
+            diag_counter[p["diagnosis"].strip()] += 1
+    top_diags  = diag_counter.most_common(6)
+    diag_labels = json.dumps([x[0] for x in top_diags])
+    diag_vals   = json.dumps([x[1] for x in top_diags])
+
+    # Appointments by day-of-week
+    dow_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    dow_counter = _col.Counter()
+    for p in patients:
+        try:
+            dt = datetime.strptime(p["date_of_appointment"], "%Y-%m-%d")
+            dow_counter[dow_names[dt.weekday()]] += 1
+        except Exception:
+            pass
+    dow_vals_list = json.dumps([dow_counter.get(d, 0) for d in dow_names])
+
+    # Exam rate
+    exam_rate = round(examined / total * 100, 1) if total else 0
+
+    body = f"""
+<style>
+.sidebar{{position:fixed;top:0;left:0;bottom:0;width:240px;
+  background:rgba(15,31,56,.97);border-right:1px solid rgba(255,255,255,.07);
+  display:flex;flex-direction:column;z-index:100}}
+.s-head{{padding:1.5rem 1.25rem;border-bottom:1px solid rgba(255,255,255,.07)}}
+.s-nav{{flex:1;padding:1.25rem .6rem;display:flex;flex-direction:column;gap:.25rem}}
+.s-item{{display:flex;align-items:center;gap:.6rem;padding:.62rem .85rem;
+  border-radius:10px;color:rgba(255,255,255,.4);font-size:.85rem;
+  border:none;background:transparent;width:100%;text-align:left;
+  cursor:pointer;font-family:inherit;text-decoration:none;transition:all .2s}}
+.s-item:hover,.s-item.active{{background:rgba(13,148,136,.15);color:var(--teal-light)}}
+.s-foot{{padding:1rem 1.25rem;border-top:1px solid rgba(255,255,255,.07)}}
+.smain{{margin-left:240px;min-height:100vh;padding:0}}
+.stopbar{{padding:1.1rem 1.75rem;border-bottom:1px solid rgba(255,255,255,.07);
+  display:flex;align-items:center;justify-content:space-between;
+  background:rgba(10,22,40,.85);backdrop-filter:blur(10px);
+  position:sticky;top:0;z-index:50}}
+.scontent{{padding:1.5rem;display:flex;flex-direction:column;gap:1.25rem}}
+.kpi-grid{{display:grid;grid-template-columns:repeat(5,1fr);gap:.85rem}}
+.kpi{{border-radius:16px;padding:1.4rem 1.2rem;border:1px solid;min-width:0;overflow:hidden}}
+.kpi-lbl{{font-size:.7rem;color:rgba(255,255,255,.55);text-transform:uppercase;
+  letter-spacing:.07em;margin-bottom:.3rem;overflow:hidden;text-overflow:ellipsis}}
+.kpi-val{{font-size:2.4rem;font-weight:800;line-height:1.1;
+  margin:.15rem 0 .3rem;display:block}}
+.kpi-note{{font-size:.75rem;color:rgba(255,255,255,.4);overflow:hidden;text-overflow:ellipsis}}
+.charts-grid{{display:grid;grid-template-columns:1fr 1fr;gap:1.1rem}}
+.charts-grid-3{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1.1rem}}
+.chart-card{{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+  border-radius:16px;padding:1.1rem;min-width:0}}
+.chart-title{{font-size:.85rem;font-weight:700;color:rgba(255,255,255,.8);
+  margin-bottom:.85rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}}
+.chart-sub{{font-size:.7rem;color:rgba(255,255,255,.35);margin-left:auto}}
+@media(max-width:1100px){{.kpi-grid{{grid-template-columns:repeat(3,1fr)}}}}
+@media(max-width:800px){{
+  .kpi-grid{{grid-template-columns:repeat(2,1fr)}}
+  .charts-grid,.charts-grid-3{{grid-template-columns:1fr}}
+}}
+.jnav{{display:inline-flex;align-items:center;gap:.3rem;
+  padding:.3rem .75rem;border-radius:100px;font-size:.78rem;font-weight:500;
+  color:rgba(255,255,255,.5);text-decoration:none;
+  border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);
+  transition:all .2s;white-space:nowrap}}
+.jnav:hover{{background:rgba(13,148,136,.2);border-color:rgba(13,148,136,.5);color:#14b8a6}}
+.sec-hdr{{font-size:.78rem;text-transform:uppercase;letter-spacing:.1em;
+  color:rgba(255,255,255,.4);margin-bottom:.6rem;
+  display:flex;align-items:center;gap:.5rem;font-weight:600}}
+.sec-bar{{display:inline-block;width:3px;height:14px;border-radius:2px;flex-shrink:0}}
+</style>
+
+<div class="sidebar">
+  <div class="s-head">
+    <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem">
+      <div style="width:34px;height:34px;background:linear-gradient(135deg,var(--teal),var(--teal-light));
+        border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:1rem">🏥</div>
+      <span style="font-weight:700;font-size:1.1rem">MediCare</span>
+    </div>
+    <div style="font-size:.75rem;color:rgba(255,255,255,.35)">Logged in as</div>
+    <div style="font-size:.9rem;color:var(--teal-light);font-weight:500;margin-top:.15rem">👨‍⚕️ {doctor_name}</div>
+  </div>
+  <nav class="s-nav">
+    <a class="s-item" href="/doctor/dashboard">📋 All Patients</a>
+    <a class="s-item" href="/doctor/dashboard">🟡 Pending
+      <span style="margin-left:auto;background:rgba(212,168,83,.3);color:var(--gold);font-size:.68rem;padding:.1rem .45rem;border-radius:100px">{pending}</span>
+    </a>
+    <a class="s-item active" href="/doctor/statistics">📊 Statistics</a>
+  </nav>
+  <div class="s-foot">
+    <a href="/doctor/logout" style="display:flex;align-items:center;gap:.5rem;
+      color:rgba(255,255,255,.3);font-size:.83rem;text-decoration:none;padding:.4rem;
+      border-radius:8px;transition:all .2s"
+      onmouseover="this.style.color='rgba(239,68,68,.7)';this.style.background='rgba(239,68,68,.07)'"
+      onmouseout="this.style.color='rgba(255,255,255,.3)';this.style.background='transparent'">
+      🚪 Sign Out
+    </a>
   </div>
 </div>
-{% endblock %}""")
 
-    def badge_class(s):
-        return {"Waiting":"badge-wait","In Progress":"badge-prog",
-                "Done Appointing":"badge-done","Cancelled":"badge-canc"}.get(s,"badge-wait")
+<div class="smain">
 
-    return render_template_string(tmpl, title=f"Examine — {patient['name']}",
-                                  patient=patient, error=error, saved=saved,
-                                  badge_class=badge_class, sym_tags=sym_tags)
+  <!-- TOP BAR -->
+  <div class="stopbar">
+    <div style="font-size:1.35rem;font-weight:700">&#128202; Statistics &amp; Analytics</div>
+    <div style="font-size:.83rem;color:rgba(255,255,255,.35)">{total} total patients</div>
+  </div>
+
+  <!-- SECTION JUMP NAV -->
+  <div style="position:sticky;top:53px;z-index:40;
+    background:rgba(10,22,40,.97);backdrop-filter:blur(10px);
+    border-bottom:1px solid rgba(255,255,255,.08);
+    padding:.55rem 1.5rem;display:flex;align-items:center;gap:.4rem;flex-wrap:wrap">
+    <span style="font-size:.72rem;color:rgba(255,255,255,.3);margin-right:.3rem;text-transform:uppercase;letter-spacing:.08em">Jump to:</span>
+    <a href="#sec-overview"  class="jnav">&#8963; Overview</a>
+    <a href="#sec-monthly"   class="jnav">&#8963; Monthly Admissions</a>
+    <a href="#sec-status"    class="jnav">&#8963; Status Trend</a>
+    <a href="#sec-symptoms"  class="jnav">&#8963; Symptoms</a>
+    <a href="#sec-diagnoses" class="jnav">&#8963; Diagnoses</a>
+    <a href="#sec-dow"       class="jnav">&#8963; By Day</a>
+    <a href="#sec-allstatus" class="jnav">&#8963; All Status</a>
+  </div>
+
+  <div class="scontent">
+
+    <!-- SECTION: Overview KPIs -->
+    <div id="sec-overview">
+      <div style="font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;
+        color:rgba(255,255,255,.35);margin-bottom:.6rem;display:flex;align-items:center;gap:.5rem">
+        <span style="display:inline-block;width:3px;height:14px;background:#14b8a6;border-radius:2px"></span>
+        Overview
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi" style="background:rgba(13,148,136,.12);border-color:rgba(13,148,136,.4)">
+          <div class="kpi-lbl">Total Patients</div>
+          <div class="kpi-val" style="color:#14b8a6">{total}</div>
+          <div class="kpi-note">All records</div>
+        </div>
+        <div class="kpi" style="background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.4)">
+          <div class="kpi-lbl">Examined</div>
+          <div class="kpi-val" style="color:#4ade80">{examined}</div>
+          <div class="kpi-note">Exam rate: {exam_rate}%</div>
+        </div>
+        <div class="kpi" style="background:rgba(212,168,83,.10);border-color:rgba(212,168,83,.4)">
+          <div class="kpi-lbl">Pending</div>
+          <div class="kpi-val" style="color:#fbbf24">{pending}</div>
+          <div class="kpi-note">Awaiting exam</div>
+        </div>
+        <div class="kpi" style="background:rgba(59,130,246,.10);border-color:rgba(59,130,246,.4)">
+          <div class="kpi-lbl">Confirmed</div>
+          <div class="kpi-val" style="color:#60a5fa">{confirmed}</div>
+          <div class="kpi-note">Ready for visit</div>
+        </div>
+        <div class="kpi" style="background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.4)">
+          <div class="kpi-lbl">Cancelled</div>
+          <div class="kpi-val" style="color:#f87171">{cancelled}</div>
+          <div class="kpi-note">Did not proceed</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION: Monthly Admissions -->
+    <div id="sec-monthly">
+      <div class="sec-hdr"><span class="sec-bar" style="background:#14b8a6"></span>Monthly Patient Admissions</div>
+      <div class="chart-card">
+        <div class="chart-title">Admissions per Month <span class="chart-sub">Line chart</span></div>
+        <canvas id="chartMonthly" height="120"></canvas>
+      </div>
+    </div>
+
+    <!-- SECTION: Status Trend -->
+    <div id="sec-status">
+      <div class="sec-hdr"><span class="sec-bar" style="background:#4ade80"></span>Examined vs Pending by Month</div>
+      <div class="chart-card">
+        <div class="chart-title">Examined vs Pending <span class="chart-sub">Line chart</span></div>
+        <canvas id="chartStatus" height="120"></canvas>
+      </div>
+    </div>
+
+    <!-- SECTION: Symptoms + Diagnoses side by side -->
+    <div class="charts-grid">
+      <div id="sec-symptoms">
+        <div class="sec-hdr"><span class="sec-bar" style="background:#f472b6"></span>Top Symptoms Reported</div>
+        <div class="chart-card">
+          <div class="chart-title">Symptom Frequency <span class="chart-sub">Line chart</span></div>
+          <canvas id="chartSymptoms" height="160"></canvas>
+        </div>
+      </div>
+      <div id="sec-diagnoses">
+        <div class="sec-hdr"><span class="sec-bar" style="background:#818cf8"></span>Top Diagnoses</div>
+        <div class="chart-card">
+          <div class="chart-title">Diagnosis Frequency <span class="chart-sub">Line chart</span></div>
+          <canvas id="chartDiagnoses" height="160"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION: Day of Week -->
+    <div id="sec-dow">
+      <div class="sec-hdr"><span class="sec-bar" style="background:#f97316"></span>Appointments by Day of Week</div>
+      <div class="chart-card">
+        <div class="chart-title">Busiest Days <span class="chart-sub">Line chart</span></div>
+        <canvas id="chartDow" height="110"></canvas>
+      </div>
+    </div>
+
+    <!-- SECTION: All Status Over Months -->
+    <div id="sec-allstatus">
+      <div class="sec-hdr"><span class="sec-bar" style="background:#fbbf24"></span>All Status Distribution Over Months</div>
+      <div class="chart-card">
+        <div class="chart-title">Examined / Pending / Confirmed / Cancelled <span class="chart-sub">Multi-line</span></div>
+        <canvas id="chartAllStatus" height="110"></canvas>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+Chart.defaults.color = 'rgba(255,255,255,0.5)';
+Chart.defaults.borderColor = 'rgba(255,255,255,0.07)';
+Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+
+const MONTHS = {json.dumps(months_order)};
+const MONTHLY = {json.dumps(monthly_vals)};
+const EX_M    = {json.dumps(ex_vals)};
+const PEND_M  = {json.dumps(pend_vals)};
+const SYM_LBL = {sym_labels};
+const SYM_VAL = {sym_vals};
+const DIAG_LBL= {diag_labels};
+const DIAG_VAL= {diag_vals};
+const DOW_LBL = {json.dumps(dow_names)};
+const DOW_VAL = {dow_vals_list};
+
+function lineOpts(title) {{
+  return {{
+    responsive:true,
+    plugins:{{legend:{{display:false}},tooltip:{{backgroundColor:'rgba(10,22,40,.95)',
+      titleColor:'#fff',bodyColor:'rgba(255,255,255,.7)',borderColor:'rgba(13,148,136,.4)',borderWidth:1}}}},
+    scales:{{
+      x:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{color:'rgba(255,255,255,.45)',font:{{size:10}}}}}},
+      y:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{color:'rgba(255,255,255,.45)',font:{{size:10}}}},beginAtZero:true}}
+    }}
+  }};
+}}
+
+function mkLine(id, labels, datasets) {{
+  new Chart(document.getElementById(id), {{
+    type:'line', data:{{labels, datasets}}, options:lineOpts()
+  }});
+}}
+
+function ds(label, data, color, fill=true) {{
+  return {{label, data, borderColor:color, backgroundColor: fill ? color+'22':'transparent',
+    borderWidth:2.5, pointBackgroundColor:color, pointRadius:4,
+    pointHoverRadius:6, tension:.35, fill}};
+}}
+
+// 1. Monthly admissions
+mkLine('chartMonthly', MONTHS, [ds('Admissions', MONTHLY, '#14b8a6')]);
+
+// 2. Examined vs Pending
+new Chart(document.getElementById('chartStatus'), {{
+  type:'line',
+  data:{{labels:MONTHS, datasets:[
+    ds('Examined', EX_M,   '#22c55e'),
+    ds('Pending',  PEND_M, '#fbbf24')
+  ]}},
+  options:{{...lineOpts(), plugins:{{...lineOpts().plugins, legend:{{display:true,
+    labels:{{color:'rgba(255,255,255,.6)',font:{{size:11}}}}}}}}}}
+}});
+
+// 3. Top symptoms
+mkLine('chartSymptoms', SYM_LBL, [ds('Cases', SYM_VAL, '#f472b6')]);
+
+// 4. Top diagnoses
+mkLine('chartDiagnoses', DIAG_LBL, [ds('Cases', DIAG_VAL, '#818cf8')]);
+
+// 5. Day of week
+mkLine('chartDow', DOW_LBL, [ds('Appointments', DOW_VAL, '#f97316')]);
+
+// 6. All 4 statuses monthly
+const conf_m = {json.dumps([_col.Counter(datetime.strptime(p['submitted_at'][:10],'%Y-%m-%d').strftime('%b') for p in patients if p['status']=='Confirmed').get(m,0) for m in months_order])};
+const canc_m = {json.dumps([_col.Counter(datetime.strptime(p['submitted_at'][:10],'%Y-%m-%d').strftime('%b') for p in patients if p['status']=='Cancelled').get(m,0) for m in months_order])};
+new Chart(document.getElementById('chartAllStatus'), {{
+  type:'line',
+  data:{{labels:MONTHS, datasets:[
+    ds('Examined',  EX_M,    '#22c55e'),
+    ds('Pending',   PEND_M,  '#fbbf24'),
+    ds('Confirmed', conf_m,  '#3b82f6'),
+    ds('Cancelled', canc_m,  '#ef4444')
+  ]}},
+  options:{{...lineOpts(), plugins:{{...lineOpts().plugins,
+    legend:{{display:true,labels:{{color:'rgba(255,255,255,.6)',font:{{size:11}}}}}}}}}}
+}});
+</script>
+
+<!-- Scroll UP button -->
+<button id="scrollUpBtn" onclick="window.scrollTo({{top:0,behavior:'smooth'}})"
+  title="Back to top"
+  style="position:fixed;bottom:80px;right:1.5rem;z-index:999;
+    width:44px;height:44px;border-radius:50%;border:none;cursor:pointer;
+    background:linear-gradient(135deg,var(--teal),var(--teal-light));
+    color:#fff;font-size:1.2rem;font-weight:700;
+    box-shadow:0 4px 18px rgba(13,148,136,.5);
+    display:none;align-items:center;justify-content:center;
+    transition:opacity .2s,transform .2s">&#8679;</button>
+
+<!-- Scroll DOWN button -->
+<button id="scrollDownBtn" onclick="window.scrollBy({{top:window.innerHeight*.85,behavior:'smooth'}})"
+  title="Scroll down"
+  style="position:fixed;bottom:1.5rem;right:1.5rem;z-index:999;
+    width:44px;height:44px;border-radius:50%;border:none;cursor:pointer;
+    background:linear-gradient(135deg,var(--teal),var(--teal-light));
+    color:#fff;font-size:1.2rem;font-weight:700;
+    box-shadow:0 4px 18px rgba(13,148,136,.5);
+    display:flex;align-items:center;justify-content:center;
+    transition:opacity .2s,transform .2s">&#8681;</button>
+
+<script>
+const upBtn   = document.getElementById('scrollUpBtn');
+const downBtn = document.getElementById('scrollDownBtn');
+window.addEventListener('scroll', () => {{
+  const scrolled = window.scrollY > 200;
+  const atBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 50;
+  upBtn.style.display   = scrolled ? 'flex' : 'none';
+  downBtn.style.opacity = atBottom ? '0.3' : '1';
+  downBtn.style.pointerEvents = atBottom ? 'none' : 'auto';
+}});
+</script>"""
+    return page("Statistics", body)
 
 
-# ── API: quick status update ──────────────────────────────────────────
-@app.route("/api/status/<int:pid>", methods=["POST"])
-@login_required
-def api_status(pid):
-    status = request.json.get("status","")
-    if status not in ("Waiting","In Progress","Done Appointing","Cancelled"):
-        return jsonify({"ok":False,"error":"Invalid status"})
-    with get_db() as c:
-        c.execute("UPDATE patients SET status=? WHERE id=?", (status, pid))
-        c.commit()
-    return jsonify({"ok":True})
+# ─────────────────────────────────────────────
+#  DASHBOARD
+# ─────────────────────────────────────────────
+def page_dashboard(doctor_name, patients):
+    total     = len(patients)
+    pending   = sum(1 for p in patients if p["status"] == "Pending")
+    confirmed = sum(1 for p in patients if p["status"] == "Confirmed")
+    examined  = sum(1 for p in patients if p["status"] == "Examined")
+    cancelled = sum(1 for p in patients if p["status"] == "Cancelled")
+
+    patients_json = json.dumps([dict(p) for p in patients])
+
+    body = """
+<style>
+.sidebar{position:fixed;top:0;left:0;bottom:0;width:240px;
+  background:rgba(15,31,56,.97);border-right:1px solid rgba(255,255,255,.07);
+  display:flex;flex-direction:column;z-index:100}
+.s-head{padding:1.5rem 1.25rem;border-bottom:1px solid rgba(255,255,255,.07)}
+.s-nav{flex:1;padding:1.25rem .6rem;display:flex;flex-direction:column;gap:.25rem}
+.s-item{display:flex;align-items:center;gap:.6rem;padding:.62rem .85rem;
+  border-radius:10px;color:rgba(255,255,255,.4);font-size:.85rem;
+  border:none;background:transparent;width:100%;text-align:left;
+  cursor:pointer;font-family:inherit;transition:all .2s}
+.s-item:hover,.s-item.active{background:rgba(13,148,136,.15);color:var(--teal-light)}
+.s-foot{padding:1rem 1.25rem;border-top:1px solid rgba(255,255,255,.07)}
+.main{margin-left:240px;min-height:100vh}
+.topbar{padding:1.1rem 1.75rem;border-bottom:1px solid rgba(255,255,255,.07);
+  display:flex;align-items:center;justify-content:space-between;
+  background:rgba(10,22,40,.85);backdrop-filter:blur(10px);
+  position:sticky;top:0;z-index:50}
+.content{padding:1.75rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:1rem;margin-bottom:1.75rem}
+.stat{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:1.25rem 1rem}
+.stat.t{border-color:rgba(13,148,136,.3);background:rgba(13,148,136,.07)}
+.stat.g{border-color:rgba(212,168,83,.3);background:rgba(212,168,83,.07)}
+.stat.gr{border-color:rgba(34,197,94,.3);background:rgba(34,197,94,.07)}
+.stat-lbl{font-size:.72rem;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem}
+.stat-val{font-size:1.9rem;font-weight:700;margin-bottom:.15rem}
+.stat.t .stat-val{color:var(--teal-light)}
+.stat.g .stat-val{color:var(--gold)}
+.stat.gr .stat-val{color:#86efac}
+.tw{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:18px;overflow:hidden}
+.th{padding:1.1rem 1.25rem;border-bottom:1px solid rgba(255,255,255,.07);
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
+table{width:100%;border-collapse:collapse}
+thead th{text-align:left;padding:.75rem 1rem;font-size:.7rem;
+  color:rgba(255,255,255,.3);text-transform:uppercase;letter-spacing:.1em;
+  border-bottom:1px solid rgba(255,255,255,.06);font-weight:400}
+tbody tr{cursor:pointer;transition:background .15s}
+tbody tr:hover td{background:rgba(13,148,136,.06)}
+tbody tr:not(:last-child) td{border-bottom:1px solid rgba(255,255,255,.04)}
+.srch{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);
+  border-radius:10px;padding:.55rem .9rem;color:#fff;font-size:.83rem;
+  width:200px;outline:none;font-family:inherit}
+.srch:focus{border-color:var(--teal)}
+.srch::placeholder{color:rgba(255,255,255,.25)}
+.fb{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);
+  color:rgba(255,255,255,.45);padding:.5rem .9rem;border-radius:9px;
+  font-size:.78rem;cursor:pointer;font-family:inherit;transition:all .2s}
+.fb.on,.fb:hover{background:rgba(13,148,136,.15);border-color:var(--teal);color:var(--teal-light)}
+</style>
+""" + f"""
+<div class="sidebar">
+  <div class="s-head">
+    <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem">
+      <div style="width:34px;height:34px;background:linear-gradient(135deg,var(--teal),var(--teal-light));
+        border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:1rem">🏥</div>
+      <span style="font-weight:700;font-size:1.1rem">MediCare</span>
+    </div>
+    <div style="font-size:.75rem;color:rgba(255,255,255,.35)">Logged in as</div>
+    <div style="font-size:.9rem;color:var(--teal-light);font-weight:500;margin-top:.15rem">👨‍⚕️ {doctor_name}</div>
+  </div>
+  <nav class="s-nav">
+    <button class="s-item active" onclick="filterStatus(null,this)">📋 All Patients
+      <span style="margin-left:auto;background:var(--teal);color:#fff;font-size:.68rem;padding:.1rem .45rem;border-radius:100px">{total}</span>
+    </button>
+    <button class="s-item" onclick="filterStatus('Pending',this)">🟡 Pending
+      <span style="margin-left:auto;background:rgba(212,168,83,.3);color:var(--gold);font-size:.68rem;padding:.1rem .45rem;border-radius:100px">{pending}</span>
+    </button>
+    <button class="s-item" onclick="filterStatus('Confirmed',this)">🟢 Confirmed</button>
+    <button class="s-item" onclick="filterStatus('Examined',this)">✅ Examined
+      <span style="margin-left:auto;background:rgba(34,197,94,.25);color:#86efac;font-size:.68rem;padding:.1rem .45rem;border-radius:100px">{examined}</span>
+    </button>
+    <button class="s-item" onclick="filterStatus('Cancelled',this)">🔴 Cancelled</button>
+    <a class="s-item" href="/doctor/statistics" style="text-decoration:none;margin-top:.5rem;border-top:1px solid rgba(255,255,255,.06);padding-top:.75rem">📊 Statistics</a>
+  </nav>
+  <div class="s-foot">
+    <a href="/doctor/logout" style="display:flex;align-items:center;gap:.5rem;
+      color:rgba(255,255,255,.3);font-size:.83rem;text-decoration:none;padding:.4rem;
+      border-radius:8px;transition:all .2s"
+      onmouseover="this.style.color='rgba(239,68,68,.7)';this.style.background='rgba(239,68,68,.07)'"
+      onmouseout="this.style.color='rgba(255,255,255,.3)';this.style.background='transparent'">
+      🚪 Sign Out
+    </a>
+  </div>
+</div>
+
+<div class="main">
+  <div class="topbar">
+    <div style="font-size:1.35rem;font-weight:700">Patient Dashboard</div>
+    <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
+      <input class="srch" type="text" id="search" placeholder="Search patients..." oninput="render()">
+      <button class="fb" onclick="location.reload()">↻ Refresh</button>
+    </div>
+  </div>
+  <div class="content">
+    <div class="stats">
+      <div class="stat t"><div class="stat-lbl">Total</div><div class="stat-val">{total}</div><div style="font-size:.75rem;color:rgba(255,255,255,.3)">Appointments</div></div>
+      <div class="stat g"><div class="stat-lbl">Pending</div><div class="stat-val">{pending}</div><div style="font-size:.75rem;color:rgba(255,255,255,.3)">Awaiting</div></div>
+      <div class="stat"><div class="stat-lbl">Confirmed</div><div class="stat-val">{confirmed}</div><div style="font-size:.75rem;color:rgba(255,255,255,.3)">Ready</div></div>
+      <div class="stat gr"><div class="stat-lbl">Examined</div><div class="stat-val">{examined}</div><div style="font-size:.75rem;color:rgba(255,255,255,.3)">Done ✓</div></div>
+    </div>
+
+    <div style="background:rgba(13,148,136,.07);border:1px solid rgba(13,148,136,.2);border-radius:12px;
+      padding:.8rem 1.1rem;margin-bottom:1.25rem;font-size:.82rem;color:rgba(255,255,255,.5);
+      display:flex;align-items:center;gap:.5rem">
+      <span style="color:var(--teal-light);font-size:1rem">💡</span>
+      Click any patient row to open the <strong style="color:var(--teal-light)">Examination Page</strong> — do the checkup, write prescription and generate receipt.
+    </div>
+
+    <div class="tw">
+      <div class="th">
+        <div style="font-size:1rem;font-weight:600">Appointment Queue</div>
+        <div style="display:flex;gap:.4rem;flex-wrap:wrap">
+          <button class="fb on" onclick="filterStatus(null,this)">All</button>
+          <button class="fb" onclick="filterStatus('Pending',this)">Pending</button>
+          <button class="fb" onclick="filterStatus('Confirmed',this)">Confirmed</button>
+          <button class="fb" onclick="filterStatus('Examined',this)">Examined</button>
+          <button class="fb" onclick="filterStatus('Cancelled',this)">Cancelled</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>Patient Name</th><th>Date</th><th>Time</th>
+              <th>Symptoms</th><th>Status</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const ALL=PATIENTS_JSON_PLACEHOLDER;
+let curFilter=null;
+
+function filterStatus(f,btn){{
+  curFilter=f;
+  document.querySelectorAll('.fb,.s-item').forEach(b=>b.classList.remove('on','active'));
+  if(btn)btn.classList.add(btn.classList.contains('fb')?'on':'active');
+  render();
+}}
+
+function render(){{
+  const q=document.getElementById('search').value.toLowerCase();
+  let data=ALL.filter(p=>(!curFilter||p.status===curFilter)&&
+    (!q||p.name.toLowerCase().includes(q)||p.symptoms.toLowerCase().includes(q)));
+  const tbody=document.getElementById('tbody');
+  if(!data.length){{
+    tbody.innerHTML='<tr><td colspan="7" style="padding:3rem;text-align:center;color:rgba(255,255,255,.2)"><div style="font-size:2rem;margin-bottom:.5rem">🗂️</div>No patients found</td></tr>';
+    return;
+  }}
+  const scMap={{
+    Pending:  ['rgba(212,168,83,.15)','rgba(212,168,83,.3)','#d4a853'],
+    Confirmed:['rgba(13,148,136,.15)','rgba(13,148,136,.3)','var(--teal-light)'],
+    Examined: ['rgba(34,197,94,.15)','rgba(34,197,94,.3)','#86efac'],
+    Cancelled:['rgba(239,68,68,.12)','rgba(239,68,68,.25)','#fca5a5']
+  }};
+  const iconMap={{Pending:'🟡',Confirmed:'🟢',Examined:'✅',Cancelled:'🔴'}};
+  tbody.innerHTML=data.map((p,i)=>{{
+    const d=new Date(p.date_of_appointment+'T00:00:00').toLocaleDateString('en-US',{{month:'short',day:'numeric',year:'numeric'}});
+    const t=new Date('1970-01-01T'+p.appointment_time).toLocaleTimeString('en-US',{{hour:'numeric',minute:'2-digit',hour12:true}});
+    const syms=p.symptoms.split(/[\\n,]+/).map(s=>s.trim()).filter(Boolean);
+    const symH=syms.slice(0,3).map(s=>`<span style="display:inline-block;background:rgba(13,148,136,.12);border:1px solid rgba(13,148,136,.2);color:var(--teal-light);font-size:.7rem;padding:.18rem .55rem;border-radius:100px;margin:.1rem">${{s}}</span>`).join('')+(syms.length>3?`<span style="background:rgba(255,255,255,.06);color:rgba(255,255,255,.4);font-size:.7rem;padding:.18rem .55rem;border-radius:100px;margin:.1rem">+${{syms.length-3}}</span>`:'');
+    const sc=scMap[p.status]||scMap.Pending;
+    const icon=iconMap[p.status]||'🟡';
+    return `<tr onclick="window.location='/doctor/patient/${{p.id}}/examine'" title="Click to examine">
+      <td style="color:rgba(255,255,255,.3);padding:.9rem 1rem">${{i+1}}</td>
+      <td style="padding:.9rem .75rem;font-weight:600">${{p.name}}</td>
+      <td style="padding:.9rem .75rem;color:rgba(255,255,255,.5);font-size:.83rem">${{d}}</td>
+      <td style="padding:.9rem .75rem;color:rgba(255,255,255,.5);font-size:.83rem">${{t}}</td>
+      <td style="padding:.9rem .75rem;font-size:.82rem;max-width:220px">${{symH}}</td>
+      <td style="padding:.9rem .75rem">
+        <span style="display:inline-block;background:${{sc[0]}};border:1px solid ${{sc[1]}};color:${{sc[2]}};padding:.3rem .75rem;border-radius:100px;font-size:.78rem;font-weight:500">
+          ${{icon}} ${{p.status}}
+        </span>
+      </td>
+      <td style="padding:.9rem .75rem" onclick="event.stopPropagation()">
+        <button onclick="window.location='/doctor/patient/${{p.id}}/examine'"
+          style="padding:.32rem .75rem;border-radius:8px;font-size:.76rem;cursor:pointer;
+            border:1px solid rgba(13,148,136,.35);background:rgba(13,148,136,.12);
+            color:var(--teal-light);font-family:inherit;margin-right:.3rem;font-weight:500">
+          🩺 Examine
+        </button>
+        <button onclick="delPt(${{p.id}})"
+          style="padding:.32rem .7rem;border-radius:8px;font-size:.76rem;cursor:pointer;
+            border:1px solid rgba(239,68,68,.25);background:rgba(239,68,68,.08);
+            color:#fca5a5;font-family:inherit">
+          🗑
+        </button>
+      </td>
+    </tr>`;
+  }}).join('');
+}}
+
+async function delPt(id){{
+  if(!confirm('Delete this patient record?')) return;
+  await fetch(`/doctor/patient/${{id}}/delete`,{{method:'POST'}});
+  location.reload();
+}}
+
+render();
+</script>
+""".replace("PATIENTS_JSON_PLACEHOLDER", patients_json)
+
+    return page("Dashboard", body)
 
 
-# ══════════════════════════════════════════════════════
-#  RUN
-# ══════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+#  REQUEST HANDLER
+# ─────────────────────────────────────────────
+class ClinicHandler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        print(f"  {self.address_string()} - {fmt % args}")
+
+    def get_session(self):
+        cookie_header = self.headers.get("Cookie", "")
+        sc = SimpleCookie()
+        sc.load(cookie_header)
+        sid = sc.get("session_id")
+        if sid:
+            return SESSIONS.get(sid.value)
+        return None
+
+    def set_session(self, doctor_id, doctor_name):
+        sid = str(uuid.uuid4())
+        SESSIONS[sid] = {"doctor_id": doctor_id, "doctor_name": doctor_name}
+        return sid
+
+    def send_html(self, html, status=200, extra_headers=None):
+        encoded = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def send_json(self, data, status=200, extra_headers=None):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length else b""
+
+    def read_form(self):
+        body = self.read_body().decode("utf-8")
+        return urllib.parse.parse_qs(body, keep_blank_values=True)
+
+    def read_json(self):
+        return json.loads(self.read_body())
+
+    # ── GET ──────────────────────────────────
+    def do_GET(self):
+        p = self.path.split("?")[0]
+
+        if p in ("/", "/landing"):
+            return self.send_html(page_landing())
+
+        elif p == "/doctor/register":
+            return self.send_html(page_doctor_register())
+
+        elif p == "/doctor/login":
+            return self.send_html(page_doctor_login())
+
+        elif p == "/doctor/logout":
+            cookie_header = self.headers.get("Cookie", "")
+            sc = SimpleCookie(); sc.load(cookie_header)
+            sid = sc.get("session_id")
+            if sid and sid.value in SESSIONS:
+                del SESSIONS[sid.value]
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "session_id=; Max-Age=0; Path=/")
+            self.end_headers()
+
+        elif p == "/doctor/dashboard":
+            sess = self.get_session()
+            if not sess:
+                return self.redirect("/doctor/login")
+            with get_db() as db:
+                pts = db.execute(
+                    "SELECT * FROM patients ORDER BY date_of_appointment ASC, appointment_time ASC"
+                ).fetchall()
+            return self.send_html(page_dashboard(sess["doctor_name"], [dict(r) for r in pts]))
+
+        elif re.match(r"^/doctor/patient/\d+/examine$", p):
+            sess = self.get_session()
+            if not sess:
+                return self.redirect("/doctor/login")
+            pid = int(p.split("/")[3])
+            with get_db() as db:
+                pt = db.execute("SELECT * FROM patients WHERE id=?", (pid,)).fetchone()
+            if not pt:
+                return self.send_html("<h1 style='font-family:sans-serif;padding:2rem'>Patient not found</h1>", 404)
+            return self.send_html(page_examine(sess["doctor_name"], dict(pt)))
+
+        elif p == "/doctor/statistics":
+            sess = self.get_session()
+            if not sess:
+                return self.redirect("/doctor/login")
+            with get_db() as db:
+                pts = db.execute("SELECT * FROM patients").fetchall()
+            return self.send_html(page_statistics(sess["doctor_name"], [dict(r) for r in pts]))
+
+        elif p == "/patient/admission":
+            return self.send_html(page_patient_admission())
+
+        else:
+            self.send_html("<h1 style='font-family:sans-serif;padding:2rem'>404 Not Found</h1>", 404)
+
+    # ── POST ─────────────────────────────────
+    def do_POST(self):
+        p = self.path.split("?")[0]
+
+        # ── Doctor Register ──
+        if p == "/doctor/register":
+            form = self.read_form()
+            name = form.get("name", [""])[0].strip()
+            pw   = form.get("password", [""])[0].strip()
+            if not name or not pw:
+                return self.send_html(page_doctor_register(error="Name and password are required"))
+            if len(pw) < 6:
+                return self.send_html(page_doctor_register(error="Password must be at least 6 characters"))
+            qr_id = str(uuid.uuid4())
+            try:
+                with get_db() as db:
+                    db.execute("INSERT INTO doctors (name, password, qr_id) VALUES (?,?,?)",
+                               (name, hash_pw(pw), qr_id))
+                    db.commit()
+                return self.send_html(page_doctor_register(success_qr=qr_id, success_name=name))
+            except sqlite3.IntegrityError:
+                return self.send_html(page_doctor_register(error="Doctor name already exists"))
+
+        # ── Doctor Login ──
+        elif p == "/doctor/login":
+            form = self.read_form()
+            name = form.get("name", [""])[0].strip()
+            pw   = form.get("password", [""])[0].strip()
+            with get_db() as db:
+                doc = db.execute("SELECT * FROM doctors WHERE name=? AND password=?",
+                                 (name, hash_pw(pw))).fetchone()
+            if doc:
+                sid = self.set_session(doc["id"], doc["name"])
+                self.send_response(302)
+                self.send_header("Location", "/doctor/dashboard")
+                self.send_header("Set-Cookie", f"session_id={sid}; Path=/; HttpOnly")
+                self.end_headers()
+            else:
+                self.send_html(page_doctor_login(error="Invalid name or password"))
+
+        # ── QR Verify ──
+        elif p == "/doctor/qr-verify":
+            data = self.read_json()
+            qr_id = data.get("qr_id", "").strip()
+            with get_db() as db:
+                doc = db.execute("SELECT * FROM doctors WHERE qr_id=?", (qr_id,)).fetchone()
+            if doc:
+                sid = self.set_session(doc["id"], doc["name"])
+                self.send_json(
+                    {"success": True, "name": doc["name"]},
+                    extra_headers={"Set-Cookie": f"session_id={sid}; Path=/; HttpOnly"}
+                )
+            else:
+                self.send_json({"success": False, "message": "Invalid QR code"})
+
+        # ── Patient Admission ──
+        elif p == "/patient/admission":
+            ct = self.headers.get("Content-Type", "")
+            if "application/json" in ct:
+                data = self.read_json()
+                name     = data.get("name", "").strip()
+                date     = data.get("date", "").strip()
+                time_val = data.get("time", "").strip()
+                symptoms = data.get("symptoms", "").strip()
+                if not all([name, date, time_val, symptoms]):
+                    return self.send_json({"success": False, "message": "All fields required"})
+                with get_db() as db:
+                    db.execute("INSERT INTO patients (name,date_of_appointment,appointment_time,symptoms) VALUES (?,?,?,?)",
+                               (name, date, time_val, symptoms))
+                    db.commit()
+                return self.send_json({"success": True})
+            else:
+                form = self.read_form()
+                name     = form.get("name", [""])[0].strip()
+                date     = form.get("date", [""])[0].strip()
+                time_val = form.get("time", [""])[0].strip()
+                symptoms = form.get("symptoms", [""])[0].strip()
+                if not all([name, date, time_val, symptoms]):
+                    return self.send_html(page_patient_admission(error="All fields are required"))
+                with get_db() as db:
+                    db.execute("INSERT INTO patients (name,date_of_appointment,appointment_time,symptoms) VALUES (?,?,?,?)",
+                               (name, date, time_val, symptoms))
+                    db.commit()
+                return self.send_html(page_patient_success(name, date, time_val, symptoms))
+
+        # ── Save Examination (POST) ──
+        elif re.match(r"^/doctor/patient/\d+/examine$", p):
+            sess = self.get_session()
+            if not sess:
+                return self.redirect("/doctor/login")
+            pid = int(p.split("/")[3])
+            form = self.read_form()
+            diagnosis    = form.get("diagnosis", [""])[0].strip()
+            prescription = form.get("prescription", [""])[0].strip()
+            notes        = form.get("notes", [""])[0].strip()
+            if not diagnosis or not prescription:
+                with get_db() as db:
+                    pt = db.execute("SELECT * FROM patients WHERE id=?", (pid,)).fetchone()
+                return self.send_html(page_examine(sess["doctor_name"], dict(pt), success=False))
+            examined_at = datetime.now().strftime("%B %d, %Y %I:%M %p")
+            with get_db() as db:
+                db.execute(
+                    "UPDATE patients SET status='Examined', diagnosis=?, prescription=?, notes=?, examined_at=? WHERE id=?",
+                    (diagnosis, prescription, notes, examined_at, pid)
+                )
+                db.commit()
+                pt = db.execute("SELECT * FROM patients WHERE id=?", (pid,)).fetchone()
+            return self.send_html(page_examine(sess["doctor_name"], dict(pt), success=True))
+
+        # ── Delete Patient ──
+        elif re.match(r"^/doctor/patient/\d+/delete$", p):
+            sess = self.get_session()
+            if not sess:
+                return self.send_json({"success": False})
+            pid = int(p.split("/")[3])
+            with get_db() as db:
+                db.execute("DELETE FROM patients WHERE id=?", (pid,))
+                db.commit()
+            self.send_json({"success": True})
+
+        else:
+            self.send_html("<h1>404</h1>", 404)
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_ENV") == "development"
+    server = http.server.HTTPServer(("", PORT), ClinicHandler)
     print()
-    print("=" * 52)
-    print("  MediCare Web App")
-    print("=" * 52)
-    print(f"  Local:   http://localhost:{port}")
-    print(f"  Network: http://0.0.0.0:{port}")
+    print("=" * 50)
+    print("   MediCare Clinic System")
+    print("=" * 50)
+    print(f"   URL  : http://localhost:{PORT}")
+    print(f"   DB   : {os.path.abspath(DB)}")
     print()
-    print("  Default login: Dr. Admin / admin123")
-    print("=" * 52)
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    print("   Default Doctor Login:")
+    print("     Name    : Dr. Admin")
+    print("     Password: admin123")
+    print()
+    print("   PATIENT FLOW:")
+    print("   1. Patient books -> status: Pending")
+    print("   2. Doctor clicks row -> Examination page")
+    print("   3. Doctor saves checkup + prescription")
+    print("      -> status: Examined + receipt generated")
+    print("   4. Back to dashboard -> shows Examined")
+    print("=" * 50)
+    print("   Press Ctrl+C to stop")
+    print()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n   Server stopped.")
